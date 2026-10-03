@@ -43,6 +43,29 @@ Backend = Literal["docker", "local"]
 ALLOWED_PROGRAMS = {"python", "python3", "uv", "node", "npm", "deno"}
 MAX_STDOUT_BYTES = 4_000_000
 
+#: Permission details that mean "this tool may reach the network". A granted
+#: `network:<detail>` maps to the default bridge network, which has egress.
+EGRESS_DETAILS = frozenset({"http", "https", "any", "dns", "tcp"})
+
+
+def docker_network_mode(grant: str) -> str:
+    """Map a *policy* network grant to a Docker network **mode**.
+
+    ``--network`` takes a network name (``none``/``bridge``/``host``/a custom
+    name), never a protocol. Passing the permission detail straight through made
+    Docker look for a network literally called ``http`` and fail with
+    ``network http not found`` — caught by the Docker CI job.
+
+    Fail-closed for anything unrecognised: an unknown detail grants no egress
+    rather than silently joining the bridge.
+    """
+    detail = (grant or "none").strip().lower()
+    if detail in {"", "none"}:
+        return "none"
+    if detail in EGRESS_DETAILS:
+        return "bridge"
+    return "none"
+
 
 @dataclass(slots=True)
 class SandboxResult:
@@ -58,7 +81,10 @@ class SandboxResult:
     cached: bool = False
     timed_out: bool = False
     backend: str = "docker"
+    #: Semantic network grant from the policy gate ("none" or, e.g., "http").
     network: str = "none"
+    #: The Docker network mode actually applied ("none" | "bridge").
+    docker_network: str = "none"
     stdout: str = ""
     stderr: str = ""
     image: str = ""
@@ -77,7 +103,7 @@ class SandboxResult:
         status = "ok" if self.ok else f"FAILED({self.error or self.exit_code})"
         return (
             f"{self.tool}@{self.version}: {status} in {self.duration_s:.2f}s "
-            f"[net={self.network} backend={self.backend}]"
+            f"[net={self.network}/docker:{self.docker_network} backend={self.backend}]"
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -93,6 +119,7 @@ class SandboxResult:
             "timed_out": self.timed_out,
             "backend": self.backend,
             "network": self.network,
+            "docker_network": self.docker_network,
             "meta": self.meta,
         }
 
@@ -247,6 +274,7 @@ class Sandbox:
                     cached=True,
                     backend=payload.get("backend", backend),
                     network=decision.network,
+                    docker_network=docker_network_mode(decision.network),
                     run_id=self.run_id,
                     meta={"cache_age_s": round(entry.age_s, 2), **payload.get("meta", {})},
                 )
@@ -277,6 +305,7 @@ class Sandbox:
                     "exit_code": outcome.exit_code,
                     "result": outcome.result,
                     "backend": outcome.backend,
+                    "docker_network": outcome.docker_network,
                     "meta": outcome.meta,
                 },
                 ttl_s=ttl,
@@ -312,7 +341,9 @@ class Sandbox:
             "--label",
             f"ultron.tool={manifest.key}",
             # --- isolation -------------------------------------------------
-            f"--network={decision.network or 'none'}",
+            # `--network` needs a docker network NAME (none/bridge/...); the
+            # policy grant ("http") is semantic and mapped here.
+            f"--network={docker_network_mode(decision.network)}",
             "--read-only",
             "--tmpfs",
             f"/tmp:rw,noexec,nosuid,nodev,size={self.settings.sandbox_tmpfs_mb}m",
@@ -413,6 +444,7 @@ class Sandbox:
             timed_out=timed_out,
             backend="docker",
             network=decision.network,
+            docker_network=docker_network_mode(decision.network),
             stdout=stdout[-4000:],
             stderr=stderr[-4000:],
             image=self.settings.sandbox_image,

@@ -33,14 +33,14 @@ against yet.
 | permission model | `registry.Permission` + `policy.PolicyGate.check` | unknown scopes are manifest errors; `secrets:*`/`fs:write:*` denied |
 | risk tiers | `policy.PolicyGate` | LOW allow · MEDIUM ask · HIGH deny-unless-pinned |
 | approval binding | `policy.ApprovalStore` | approvals keyed to `(tool, version, manifest hash, input digest)`, TTL'd, single-use |
-| container hardening | `sandbox.Sandbox._docker_argv` | network/ro-fs/caps/uid/limits/timeout |
+| container hardening | `sandbox.Sandbox._docker_argv` | network mode (`none`/`bridge`), ro-fs, caps, uid, limits, timeout |
 | output trust | `verifier.Verifier` | fail = not cached, not remembered, run stops |
 | audit trail | `policy.AuditLog` | JSONL of every decision, with digests rather than payloads |
 
 ## Container properties (asserted in `tests/test_smoke.py`)
 
 ```
---network=none | <granted>     --read-only      --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
+--network=none | bridge(when granted)   --read-only      --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
 --cap-drop ALL                 --security-opt no-new-privileges      --user 65534:65534
 --ipc=none                     --memory=512m --memory-swap=512m      --cpus=1 --pids-limit=128
 --ulimit nofile=256:256        -v <repo>:/workspace:ro               -w /workspace
@@ -72,7 +72,8 @@ and the tool's partial stdout is *not* treated as a result.
 * **The `local` backend is not a sandbox.** It exists for tests/CI, requires
   `ULTRON_ALLOW_LOCAL_SANDBOX=1`, and labels every result
   `network=host(unenforced)`.
-* **Network is binary.** With `network:http` a tool can reach *any* host. Domain
+* **Network is binary.** A granted `network:http` maps to Docker mode `bridge`, i.e. a
+  tool can reach *any* host (unknown permission details fail closed to `none`). Domain
   allowlisting needs an egress proxy (planned with Phase 2 discovery).
 * **Resource limits are per-container**, not per-run: the run budget caps cost,
   time, steps and LLM calls, but a tool can still use its full CPU/memory slice

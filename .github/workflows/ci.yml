@@ -145,6 +145,12 @@ jobs:
           ULTRON_SANDBOX: docker
           ULTRON_ALLOW_LOCAL_SANDBOX: "0"
           ULTRON_SANDBOX_IMAGE: ultron-tools:phase1
+          # Hermetic: the container reads the fixture corpus from the read-only
+          # repo mount instead of the live web, so this job cannot flake on an
+          # external site refusing a CI runner's IP. Real egress is proven by the
+          # network-mode assertions below, not by reaching a third party.
+          ULTRON_WEB_MOCK: /workspace/eval/fixtures/web_mock.json
+          ULTRON_ENV_ALLOWLIST: ULTRON_WEB_MOCK
         run: |
           uv run python - <<'PY'
           import json
@@ -157,18 +163,36 @@ jobs:
           registry = Registry(settings).load(strict=True)
           sandbox = Sandbox(settings, backend="docker")
           gate = PolicyGate(settings)
-          for name, inputs in (("calc", {"expression": "12*(3+4)"}),
-                               ("web_research", {"query": "fluoridation", "max_sources": 1})):
+
+          for name, inputs, expected_net, expected_mode in (
+              ("calc", {"expression": "12*(3+4)"}, "none", "none"),
+              ("web_research", {"query": "fluoridation", "max_sources": 2}, "http", "bridge"),
+          ):
               manifest = registry.get(name)
-              request = PolicyRequest(tool=manifest, inputs=inputs, goal="ci")
-              decision = gate.check(request)
+              decision = gate.check(PolicyRequest(tool=manifest, inputs=inputs, goal="ci"))
               assert decision.action == "allow", decision.reason
-              # web_research asks for network, so the gate must grant exactly that
-              expected_net = manifest.network_detail if manifest.wants_network else "none"
+              # the semantic grant must match the manifest's declaration...
               assert decision.network == expected_net, (decision.network, expected_net)
+              # ...and docker must get a network MODE, not the permission detail
+              argv = sandbox.docker_command_preview(manifest, decision)
+              assert f"--network={expected_mode}" in argv, argv
               result = sandbox.run(manifest, inputs, decision, use_cache=False)
               assert result.ok, f"{name} failed: {result.error}\n{result.stderr[-800:]}"
-              print(name, "->", json.dumps(result.result)[:160])
+              assert result.docker_network == expected_mode, result.docker_network
+              print(f"{name} -> net={result.network}/docker:{result.docker_network} "
+                    f"{json.dumps(result.result)[:140]}")
+
+          # hardening flags are applied to every container, not just documented
+          calc = registry.get("calc")
+          preview = " ".join(
+              sandbox.docker_command_preview(
+                  calc, gate.check(PolicyRequest(tool=calc, inputs={"expression": "1+1"}))
+              )
+          )
+          for flag in ("--read-only", "--cap-drop ALL", "no-new-privileges", "--user", "65534",
+                       "--pids-limit", "--memory", "--tmpfs", "/workspace:ro"):
+              assert flag in preview, f"missing hardening flag: {flag}"
+          print("container hardening flags verified")
           # a tool that is denied never reaches docker at all
           denied = gate.check(PolicyRequest(tool=registry.get("http_fetch"),
                                             inputs={"url": "https://example.com", "max_bytes": 100}))

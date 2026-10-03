@@ -215,7 +215,10 @@ def test_docker_argv_is_locked_down(settings, registry):
     manifest = registry.get("web_research")
     argv = sandbox.docker_command_preview(manifest, low_risk_decision("http"))
     joined = " ".join(argv)
-    assert "--network=http" in argv  # network granted by the gate
+    # A granted `network:http` maps to the egress-capable bridge network.
+    # Regression: docker takes a network NAME, so passing the permission detail
+    # verbatim failed with "network http not found" (caught by the Docker CI job).
+    assert "--network=bridge" in argv
     assert "--read-only" in argv
     assert "--cap-drop ALL" in argv or "ALL" in argv
     assert "no-new-privileges" in argv
@@ -235,6 +238,47 @@ def test_docker_argv_defaults_to_no_network(settings, registry):
     argv = sandbox.docker_command_preview(registry.get("calc"), low_risk_decision("none"))
     assert "--network=none" in argv
     assert argv[-3:] == ["python", "-m", "tools.calc"]
+
+
+@pytest.mark.parametrize(
+    "grant,expected",
+    [
+        ("none", "none"),
+        ("", "none"),
+        ("http", "bridge"),
+        ("https", "bridge"),
+        ("dns", "bridge"),
+        ("any", "bridge"),
+        ("smtp", "none"),  # unknown/unsupported detail: fail closed
+        ("host", "none"),  # host networking is never granted in Phase 1
+        ("HTTP", "bridge"),  # case-insensitive
+    ],
+)
+def test_docker_network_mode_mapping(grant, expected):
+    """Network grants are semantic; docker needs a mode. Unknown => no egress."""
+    from ultron.sandbox import docker_network_mode
+
+    assert docker_network_mode(grant) == expected
+
+
+def test_sandbox_result_reports_both_network_semantics(settings, registry):
+    """The semantic grant ("http") and the applied mode ("bridge") are separate."""
+    sandbox = Sandbox(settings, backend="docker")
+    manifest = registry.get("web_research")
+    from ultron.policy import PolicyDecision
+
+    decision = PolicyDecision(
+        action="allow",
+        reason="test",
+        risk="low",
+        tool="web_research",
+        version="0.1.0",
+        network="http",
+        granted=True,
+        limits={"timeout_s": 10},
+    )
+    argv = sandbox.docker_command_preview(manifest, decision)
+    assert "--network=bridge" in argv
 
 
 def test_scrub_env_drops_secret_looking_names(monkeypatch):
