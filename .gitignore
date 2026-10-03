@@ -1,0 +1,30 @@
+# secrets / local config
+.env
+.ultron/
+*.pem
+*.key
+credentials.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# eval artifacts
+eval/last_report.json
+eval/last_report.md
+
+# os
+.DS_Store
+
+# eval state (isolated cache/memory used by the eval harness)
+eval/.state/
+eval/report.json

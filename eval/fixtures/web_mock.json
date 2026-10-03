@@ -1,0 +1,35 @@
+{
+  "_comment": "Deterministic fixture corpus for the eval harness. ULTRON_WEB_MOCK points here so CI never needs network egress. Keywords are chosen so the planner's registry search and the tool's relevance scoring both route to a real document.",
+  "documents": [
+    {
+      "url": "https://fixtures.local/fluoridation/overview",
+      "title": "Community water fluoridation: dental health outcomes",
+      "text": "Community water fluoridation adjusts the fluoride concentration in public drinking water to a level that prevents tooth decay. Reviews of fluoridation programs consistently report a substantial reduction in dental caries among children and adults. Fluoride works both systemically during tooth development and topically on erupted teeth. Public health agencies describe fluoridation as one of the most cost-effective population-level dental interventions available."
+    },
+    {
+      "url": "https://fixtures.local/fluoridation/safety",
+      "title": "Fluoridation safety monitoring and dental fluorosis",
+      "text": "The main documented harm of water fluoridation is dental fluorosis, a cosmetic change in tooth enamel that occurs when total fluoride intake is excessive during tooth development. Surveillance programs monitor fluorosis prevalence and adjust water fluoride targets accordingly. Systematic reviews have not found evidence linking community water fluoridation at recommended concentrations to serious systemic disease. Regulatory agencies review the evidence base on a rolling basis."
+    },
+    {
+      "url": "https://fixtures.local/fluoridation/equity",
+      "title": "Equity effects of water fluoridation",
+      "text": "Because fluoridation reaches every household connected to a water system regardless of income, public health researchers highlight its equity effects. Populations with limited access to dental care show the largest absolute reduction in caries in fluoridated areas. Costs per cavity prevented are low compared with clinical treatment alternatives. Debates about fluoridation often involve questions of consent and individual choice alongside population benefit."
+    },
+    {
+      "url": "https://fixtures.local/batteries/economics",
+      "title": "Grid-scale battery storage economics",
+      "text": "Grid-scale battery storage costs have fallen sharply as lithium-ion manufacturing scaled up. Battery storage is now routinely paired with solar generation to shift energy into evening demand peaks. Analysts describe arbitrage between cheap midday charging and expensive evening discharge as the core revenue model. Battery storage economics depend on cycle life, round-trip efficiency, and capacity market payments. Long-duration storage remains more expensive per kilowatt hour than shorter duration lithium-ion systems."
+    },
+    {
+      "url": "https://fixtures.local/batteries/markets",
+      "title": "Battery storage in electricity markets",
+      "text": "Electricity markets compensate battery storage through energy arbitrage, frequency regulation, and capacity payments. Battery storage deployment growth is fastest where interconnection queues are short and grid operators allow storage to provide multiple services. Analysts note that revenue stacking across several markets is often necessary for battery projects to reach profitability. Battery costs continue to decline but financing conditions now dominate project economics."
+    },
+    {
+      "url": "https://fixtures.local/report",
+      "title": "Example report",
+      "text": "This is a placeholder document used by the http_fetch mock. Because http_fetch declares medium risk, the policy gate refuses to run it without a human, so this text is normally never read."
+    }
+  ]
+}

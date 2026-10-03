@@ -1,0 +1,60 @@
+"""Ultron: a cost-optimized, safe, autonomous tool-forging agent harness.
+
+Phase 1 (this branch) ships a *safe executor* plus an eval gate:
+
+    goal -> cheap router -> deterministic plan -> policy gate -> Docker sandbox
+         -> verification -> memory -> answer
+
+Public surface::
+
+    from ultron import Agent, Registry, PolicyGate, Sandbox, Verifier
+
+Everything is dependency-injectable, so the whole harness runs offline with
+deterministic stubs (see ``eval/run.py`` and ``tests/``).
+"""
+
+from __future__ import annotations
+
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
+
+try:  # installed package
+    __version__ = _version("ultron")
+except PackageNotFoundError:  # running from a source checkout
+    __version__ = "0.1.0"
+
+__all__ = [
+    "Agent",
+    "AgentResult",
+    "Cache",
+    "Memory",
+    "Planner",
+    "PolicyGate",
+    "Registry",
+    "Router",
+    "Sandbox",
+    "Verifier",
+    "__version__",
+]
+
+_LAZY = {
+    "Agent": ("ultron.agent", "Agent"),
+    "AgentResult": ("ultron.agent", "AgentResult"),
+    "Cache": ("ultron.cache", "Cache"),
+    "Memory": ("ultron.memory", "Memory"),
+    "Planner": ("ultron.planner", "Planner"),
+    "PolicyGate": ("ultron.policy", "PolicyGate"),
+    "Registry": ("ultron.registry", "Registry"),
+    "Router": ("ultron.router", "Router"),
+    "Sandbox": ("ultron.sandbox", "Sandbox"),
+    "Verifier": ("ultron.verifier", "Verifier"),
+}
+
+
+def __getattr__(name: str):  # PEP 562 lazy imports keep `import ultron` cheap
+    if name in _LAZY:
+        import importlib
+
+        module_name, attr = _LAZY[name]
+        return getattr(importlib.import_module(module_name), attr)
+    raise AttributeError(f"module 'ultron' has no attribute {name!r}")

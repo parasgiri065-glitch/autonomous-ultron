@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/autonomous-ultron/ultron/tools/schema.json",
+  "title": "Ultron tool manifest",
+  "description": "Contract for a single tool. Read by the registry (validation), the policy gate (risk + permissions), the sandbox (entrypoint + permissions) and the verifier (inputs/outputs).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "version", "entrypoint", "risk"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,48}$",
+      "description": "Stable tool identifier (snake_case)."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+([-+][0-9A-Za-z.-]+)?$",
+      "description": "Semver. Multiple versions may coexist; plans can pin one."
+    },
+    "entrypoint": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_./\\- ]+$",
+      "description": "Shell-free argv string executed inside the sandbox, relative to the repo mount. Shell metacharacters are rejected.",
+      "examples": ["python -m tools.web_research"]
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "What the tool does. Used by the deterministic planner search."
+    },
+    "risk": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "low = auto-approve (still sandboxed), medium = human approval, high = deny unless a pinned approval exists."
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(network|fs|proc|env|secrets|clock|gpu)(:[a-z0-9_./*-]+)?$"
+      },
+      "description": "Declared capabilities. network:* is only granted when this list asks for it (and the policy gate approves). secrets:* is denied in Phase 1.",
+      "examples": [["network:http"]]
+    },
+    "inputs": {
+      "type": "object",
+      "description": "Input schema: field name -> type. The policy gate validates actual values against this before execution a tool is ever started.",
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["string", "int", "float", "bool", "list[string]", "list[float]", "list[int]", "dict", "any"]
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "description": "Output schema: field name -> type. The verifier checks the tool's JSON result against this.",
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["string", "int", "float", "bool", "list[string]", "list[float]", "list[int]", "dict", "any"]
+      }
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Free-form keywords for deterministic registry search."
+    },
+    "deterministic": {
+      "type": "boolean",
+      "default": true,
+      "description": "True when the tool never calls an LLM. Deterministic tools are preferred by the planner because they cost $0 and cache perfectly."
+    },
+    "timeout_s": {
+      "type": ["number", "null"],
+      "minimum": 1,
+      "description": "Requested sandbox timeout. Clamped to the harness ceiling."
+    },
+    "cache_ttl_s": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "How long tool outputs stay cacheable. 0 disables caching for this tool."
+    },
+    "price_estimate_usd": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0,
+      "description": "Expected spend per invocation, used by the planner's cost model."
+    },
+    "author": { "type": "string" }
+  }
+}
