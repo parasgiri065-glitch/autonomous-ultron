@@ -37,12 +37,15 @@ __all__ = [
     "ProvenanceEnvelope",
     "PyPIHarvester",
     "Registry",
+    "RepairEngine",
+    "RepairTicket",
     "Router",
     "Sandbox",
     "Scavenger",
     "TelegramBotClient",
     "TelegramCockpit",
     "TelegramPrompter",
+    "ToolRefinery",
     "Verifier",
     "__version__",
 ]
@@ -57,6 +60,8 @@ _LAZY = {
     "ForgeEngine": ("ultron.forge", "ForgeEngine"),
     "Memory": ("ultron.memory", "Memory"),
     "PyPIHarvester": ("ultron.harvester", "PyPIHarvester"),
+    "RepairEngine": ("ultron.repair", "RepairEngine"),
+    "RepairTicket": ("ultron.repair", "RepairTicket"),
     "Planner": ("ultron.planner", "Planner"),
     "PolicyGate": ("ultron.policy", "PolicyGate"),
     "ProvenanceEnvelope": ("ultron.provenance", "ProvenanceEnvelope"),
@@ -67,6 +72,7 @@ _LAZY = {
     "TelegramBotClient": ("ultron.interfaces.telegram", "TelegramBotClient"),
     "TelegramCockpit": ("ultron.interfaces.telegram", "TelegramCockpit"),
     "TelegramPrompter": ("ultron.interfaces.telegram", "TelegramPrompter"),
+    "ToolRefinery": ("ultron.refinery", "ToolRefinery"),
     "Verifier": ("ultron.verifier", "Verifier"),
 }
 
