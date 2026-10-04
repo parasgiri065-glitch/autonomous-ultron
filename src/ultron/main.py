@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ from .agent import Agent
 from .cache import Cache
 from .config import get_settings
 from .errors import HumanApprovalRequired, PolicyDenied, SandboxUnavailable, UltronError
+from .forge import ForgeEngine
+from .ledger import FailureLedger
 from .llm import providers_configured
 from .memory import Memory
 from .policy import DenyAllPrompter, PolicyGate, default_prompter
@@ -305,6 +308,59 @@ def cmd_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gaps(args: argparse.Namespace) -> int:
+    ledger = FailureLedger(get_settings().state_dir)
+    if args.clear:
+        ledger.clear()
+        if args.json:
+            _print_json({"cleared": True})
+        else:
+            _console().print("Capability gap ledger cleared.")
+        return 0
+    gaps = ledger.read()
+    if not gaps:
+        if args.json:
+            _print_json([])
+        else:
+            _console().print("No capability gaps recorded.")
+        return 0
+    if args.json:
+        _print_json([gap.as_dict() for gap in gaps])
+        return 0
+    from rich.table import Table
+
+    table = Table(title="Missing capability gaps", header_style="bold")
+    for column in ("requests", "goal", "requires", "provides", "last attempt"):
+        table.add_column(column)
+    for gap in gaps:
+        table.add_row(
+            str(gap.frequency),
+            gap.goal[:80],
+            ", ".join(f"{k}:{v}" for k, v in gap.required_inputs.items()) or "-",
+            ", ".join(gap.suggested_provides) or "-",
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(gap.timestamp)),
+        )
+    _console().print(table)
+    return 0
+
+
+def cmd_forge(args: argparse.Namespace) -> int:
+    engine = ForgeEngine(get_settings())
+    forged = engine.auto_forge_from_ledger(top_n=args.limit)
+    report = {
+        "forged": [manifest.key for manifest in forged],
+        **engine.last_report,
+    }
+    if args.json:
+        _print_json(report)
+    else:
+        _console().print(f"Forged: {', '.join(report['forged']) or 'none'}")
+        for label in ("failed", "skipped"):
+            for item in report[label]:
+                _console().print(f"{label.title()}: {item['goal']} — {item['reason']}")
+    return 0 if not report["failed"] else 1
+
+
 def _load_eval_module():
     """Import ``eval/run.py`` by path (it deliberately is not a package)."""
     import importlib.util
@@ -394,6 +450,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--backend", choices=["docker", "local"], default="local")
     p_eval.add_argument("--no-report", action="store_true")
     p_eval.set_defaults(func=cmd_eval)
+
+    p_gaps = add_sub("gaps", help="show or clear recorded capability gaps")
+    p_gaps.add_argument("--clear", action="store_true", help="empty the failure ledger")
+    p_gaps.set_defaults(func=cmd_gaps)
+
+    p_forge = add_sub("forge", help="process explicit-code capability forge templates")
+    p_forge.add_argument("--limit", type=int, default=3, help="maximum gaps to process")
+    p_forge.set_defaults(func=cmd_forge)
 
     p_doc = add_sub("doctor", help="check the environment")
     p_doc.set_defaults(func=cmd_doctor)

@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from .cache import canonical_json, make_key
+from .charter import Charter
 from .config import Settings, get_settings
 from .errors import HumanApprovalRequired, PolicyDenied
 from .registry import PHASE1_DENIED_SCOPES, TYPE_MAP, RiskTier, ToolManifest
@@ -199,6 +200,7 @@ class PolicyRequest:
     run_id: str = "run"
     goal: str = ""
     step: int = 0
+    action_type: str = "tool_execution"
     allow_network: bool | None = None  # None -> derive from manifest + settings
 
 
@@ -428,6 +430,7 @@ class PolicyGate:
         prompter: Prompter | None = None,
         store: ApprovalStore | None = None,
         audit: AuditLog | None = None,
+        charter: Charter | None = None,
         run_id: str = "run",
     ) -> None:
         self.settings = settings or get_settings()
@@ -435,6 +438,7 @@ class PolicyGate:
         self.prompter: Prompter = prompter or default_prompter(self.settings)
         self.store = store or ApprovalStore(self.settings.approvals_file)
         self.audit = audit or AuditLog(self.settings.audit_log, run_id=run_id)
+        self.charter = charter or Charter(self.settings.state_dir)
 
     # ------------------------------------------------------------ entry points
     def check(self, request: PolicyRequest, *, consume: bool = True) -> PolicyDecision:
@@ -577,8 +581,37 @@ class PolicyGate:
         return self.check(request, consume=False)
 
     def evaluate(self, request: PolicyRequest, *, interactive: bool = True) -> PolicyDecision:
-        """``check`` then, if needed and allowed, ask the human. Raises on deny."""
+        """``check`` then apply the charter before any human prompt."""
+        tier = self.charter.evaluate(request.action_type)
+        if tier == "red":
+            self.charter.log(request.action_type, tier=tier, detail="halted")
+            raise PolicyDenied(
+                f"autonomy charter RED action: {request.action_type}",
+                tool=request.tool.name,
+                risk=request.tool.risk.value,
+            )
+        if tier == "yellow":
+            self.charter.log(
+                request.action_type, tier=tier, detail="notify-after; policy continues"
+            )
+
         decision = self.check(request)
+        if (
+            tier == "green"
+            and request.action_type in {"forge_test", "sandbox_execution"}
+            and not request.tool.wants_network
+            and decision.action == "ask"
+        ):
+            # A green charter bypass is only for an offline sandbox. A network
+            # declaration follows the ordinary policy path and therefore needs a
+            # separate grant/prompt; the charter never creates egress.
+            decision.action = "allow"
+            decision.granted = True
+            decision.verdict = "not_required"
+            decision.reason = "charter GREEN: sandbox test auto-approved"
+            self.audit.append(
+                "charter_green", action_type=request.action_type, tool=request.tool.key
+            )
         if decision.action == "deny":
             raise PolicyDenied(decision.reason, tool=request.tool.name, risk=decision.risk)
         if decision.action == "allow":

@@ -35,6 +35,8 @@ from .errors import (
     SandboxError,
     SandboxUnavailable,
 )
+from .forge import ForgeEngine
+from .ledger import FailureLedger
 from .llm import LLMClient
 from .memory import Memory, RunRecord
 from .planner import Plan, Planner, PlanStep
@@ -264,6 +266,7 @@ class Agent:
         gate: PolicyGate | None = None,
         sandbox: Sandbox | None = None,
         breaker: BreakerVerifier | None = None,
+        forge_engine: ForgeEngine | None = None,
         run_id: str | None = None,
         interactive: bool = False,
         use_memory_recall: bool = True,
@@ -274,6 +277,9 @@ class Agent:
         self.run_id = run_id or Memory.new_run_id()
         self.cache = cache or Cache(self.settings, run_id=self.run_id)
         self.memory = memory or Memory(self.settings)
+        self.ledger = FailureLedger(self.settings.state_dir)
+        self.forge_engine = forge_engine
+        self._forge_attempted: set[str] = set()
         self.llm = llm or LLMClient(self.cache, self.settings)
         self.breaker = breaker or BreakerVerifier()
         self.gate = gate or PolicyGate(self.settings, run_id=self.run_id)
@@ -354,6 +360,24 @@ class Agent:
 
             # --- 3. execute steps -------------------------------------------
             if plan.is_empty:
+                self.ledger.record_gap(
+                    goal,
+                    expected_outputs={"answer": "string"},
+                    suggested_provides=["answer.text"],
+                    failure_reason="planner found no executable tool or capability chain",
+                )
+                result.notes.append("missing capability recorded in the failure ledger")
+                if self.forge_engine is not None and goal not in self._forge_attempted:
+                    self._forge_attempted.add(goal)
+                    forged = self.forge_engine.auto_forge_from_ledger(top_n=1)
+                    if forged:
+                        self.registry = self.forge_engine.registry
+                        self.router.registry = self.registry
+                        self.planner.registry = self.registry
+                        result.notes.append(
+                            f"forged {', '.join(item.key for item in forged)}; retrying"
+                        )
+                        return self.run(goal, max_steps=max_steps)
                 return self._finish_without_tools(result, run_id, started, goal)
 
             for step in plan.steps:
@@ -473,6 +497,7 @@ class Agent:
             run_id=run_id,
             goal=goal,
             step=step.index,
+            action_type="network_egress" if manifest.wants_network else "tool_execution",
         )
 
         # --- policy gate: the choke point ----------------------------------
