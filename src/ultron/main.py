@@ -31,7 +31,9 @@ from .ledger import FailureLedger
 from .llm import providers_configured
 from .memory import Memory
 from .policy import DenyAllPrompter, PolicyGate, default_prompter
+from .refinery import RefineryError, ToolRefinery
 from .registry import Registry
+from .repair import RepairEngine, RepairError
 from .sandbox import Sandbox
 from .scavenger import Scavenger
 
@@ -484,6 +486,103 @@ def _infer_cli_type(value: Any) -> str:
     return "string"
 
 
+def cmd_refine(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    try:
+        raw_code = Path(args.path).read_text(encoding="utf-8")
+        test_input = json.loads(args.test_input) if args.test_input else {}
+        expected_schema = (
+            json.loads(args.output_schema) if args.output_schema else {"result": "any"}
+        )
+        if not isinstance(test_input, dict) or not isinstance(expected_schema, dict):
+            raise RefineryError("--test-input and --output-schema must be JSON objects")
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in expected_schema.items()
+        ):
+            raise RefineryError("--output-schema values must be manifest type names")
+        provides = (
+            args.provides or [f"refined.{key}" for key in expected_schema] or ["refined.result"]
+        )
+        requires = args.requires or []
+        refinery = ToolRefinery(settings)
+        code, manifest = refinery.refine_code(raw_code, args.function, provides, requires)
+        if args.dry_run:
+            payload = {
+                "path": str(args.path),
+                "target": args.function,
+                "manifest": manifest,
+                "wrapper_bytes": len(code.encode("utf-8")),
+                "dry_run": True,
+            }
+        else:
+            tool = refinery.cook_and_register(raw_code, args.function, test_input, expected_schema)
+            payload = {
+                "path": str(args.path),
+                "target": args.function,
+                "tool": tool.key,
+                "risk": tool.risk.value,
+                "provides": tool.provides,
+                "requires": tool.requires,
+                "dry_run": False,
+            }
+    except (OSError, RefineryError, json.JSONDecodeError, RepairError) as exc:
+        if args.json:
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            _console().print(f"[red]refine failed[/red]: {exc}")
+        return 1
+    if args.json:
+        _print_json({"ok": True, **payload})
+    else:
+        from rich.table import Table
+
+        table = Table(title="Tool refinery", header_style="bold")
+        table.add_column("field")
+        table.add_column("value")
+        for key, value in payload.items():
+            table.add_row(
+                key, json.dumps(value, default=str) if not isinstance(value, str) else value
+            )
+        _console().print(table)
+    return 0
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    engine = RepairEngine(get_settings())
+    if not args.list:
+        if args.json:
+            _print_json({"ok": False, "error": "use `ultron repair --list` to view open tickets"})
+        else:
+            _console().print("Use [bold]ultron repair --list[/bold] to view open repair tickets.")
+        return 1
+    tickets = engine.open_tickets()
+    payload = [
+        {
+            "id": ticket.ticket_id,
+            "component": ticket.component,
+            "error": ticket.error,
+            "status": ticket.status,
+            "created_at": ticket.created_at,
+        }
+        for ticket in tickets
+    ]
+    if args.json:
+        _print_json({"ok": True, "tickets": payload})
+        return 0
+    from rich.table import Table
+
+    table = Table(title="Open repair tickets", header_style="bold")
+    for column in ("id", "component", "error", "status"):
+        table.add_column(column)
+    for ticket in payload:
+        table.add_row(ticket["id"], ticket["component"], ticket["error"], ticket["status"])
+    _console().print(table)
+    if not tickets:
+        _console().print("No open repair tickets.")
+    return 0
+
+
 def cmd_telegram(args: argparse.Namespace) -> int:
     settings = get_settings()
     if not settings.telegram_bot_token:
@@ -624,6 +723,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_harvest.add_argument("--output-key", default="result", help="manifest output field")
     p_harvest.add_argument("--dry-run", action="store_true", help="inspect and synthesize only")
     p_harvest.set_defaults(func=cmd_harvest)
+
+    p_refine = add_sub("refine", help="AST-harden and test a raw Python tool")
+    p_refine.add_argument("path")
+    p_refine.add_argument("--function", default="run", help="target function in the raw file")
+    p_refine.add_argument(
+        "--test-input", default="{}", help="JSON object passed to the cooked tool"
+    )
+    p_refine.add_argument("--output-schema", default='{"result":"any"}', help="JSON output schema")
+    p_refine.add_argument("--provides", action="append", default=None, help="semantic output tag")
+    p_refine.add_argument("--requires", action="append", default=None, help="semantic input tag")
+    p_refine.add_argument(
+        "--dry-run", action="store_true", help="refine without sandboxing or registration"
+    )
+    p_refine.set_defaults(func=cmd_refine)
+
+    p_repair = add_sub("repair", help="inspect self-repair tickets")
+    p_repair.add_argument("--list", action="store_true", help="show open repair tickets")
+    p_repair.set_defaults(func=cmd_repair)
 
     p_telegram = add_sub("telegram", help="start the Telegram cockpit")
     p_telegram.add_argument("--timeout", type=int, default=20, help="long-poll timeout seconds")
