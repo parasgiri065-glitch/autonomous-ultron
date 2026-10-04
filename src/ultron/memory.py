@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS runs (
     llm_calls           INTEGER DEFAULT 0,
     answer              TEXT,
     error               TEXT,
+    chain               TEXT NOT NULL DEFAULT '[]',
     created_at          REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_runs_digest ON runs (goal_digest, registry_fingerprint);
@@ -115,6 +116,7 @@ class RunRecord:
     llm_calls: int = 0
     answer: str = ""
     error: str = ""
+    chain: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -152,6 +154,11 @@ class Memory:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            # Phase 2.1 adds one additive field; keep existing operator stores
+            # readable without requiring a destructive migration.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+            if "chain" not in columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN chain TEXT NOT NULL DEFAULT '[]'")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10.0)
@@ -200,7 +207,7 @@ class Memory:
         with self._connect() as conn:
             conn.execute(
                 """UPDATE runs SET status=?, success=?, verified=?, steps_planned=?, steps_executed=?,
-                   cost_usd=?, latency_s=?, cache_hits=?, cache_misses=?, llm_calls=?, answer=?, error=?
+                   cost_usd=?, latency_s=?, cache_hits=?, cache_misses=?, llm_calls=?, answer=?, error=?, chain=?
                    WHERE run_id=?""",
                 (
                     record.status,
@@ -215,6 +222,7 @@ class Memory:
                     record.llm_calls,
                     (record.answer or "")[:8000],
                     (record.error or "")[:2000],
+                    json.dumps(record.chain, separators=(",", ":")),
                     record.run_id,
                 ),
             )
@@ -384,11 +392,19 @@ class Memory:
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT run_id, goal, status, success, verified, cost_usd, latency_s, cache_hits,
-                          cache_misses, steps_executed, created_at
+                          cache_misses, steps_executed, chain, created_at
                    FROM runs ORDER BY created_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["chain"] = json.loads(item.get("chain") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                item["chain"] = []
+            result.append(item)
+        return result
 
     def forget_runs(self, before: float | None = None) -> int:
         """Prune history (used by CI to keep the eval store small)."""

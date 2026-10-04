@@ -2,8 +2,21 @@
   "name": "web_research",
   "version": "0.1.0",
   "entrypoint": "python -m tools.web_research",
-  "permissions": ["network:http"],
+  "permissions": [
+    "network:http"
+  ],
   "risk": "low",
-  "inputs": {"query": "string", "max_sources": "int"},
-  "outputs": {"summary": "string", "sources": "list[string]", "confidence": "float"}
+  "inputs": {
+    "query": "string",
+    "max_sources": "int"
+  },
+  "outputs": {
+    "summary": "string",
+    "sources": "list[string]",
+    "confidence": "float"
+  },
+  "provides": [
+    "research.summary"
+  ],
+  "requires": []
 }

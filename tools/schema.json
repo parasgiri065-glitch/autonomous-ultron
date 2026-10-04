@@ -33,6 +33,18 @@
       "enum": ["low", "medium", "high"],
       "description": "low = auto-approve (still sandboxed), medium = human approval, high = deny unless a pinned approval exists."
     },
+    "provides": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Optional semantic types emitted by the tool, used for deterministic pipeline composition."
+    },
+    "requires": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Optional semantic types that must already be available before the tool runs."
+    },
     "permissions": {
       "type": "array",
       "items": {

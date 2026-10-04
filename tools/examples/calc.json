@@ -5,11 +5,28 @@
   "permissions": [],
   "risk": "low",
   "description": "Calculate arithmetic on a simple expression (+, -, *, /, %, ** and parentheses). Use this to compute, evaluate or solve numeric expressions. No network, no LLM, always cacheable.",
-  "inputs": {"expression": "string"},
-  "outputs": {"result": "float", "expression": "string", "normalized": "string"},
-  "tags": ["math", "arithmetic", "calculate", "compute", "deterministic", "offline"],
+  "inputs": {
+    "expression": "string"
+  },
+  "outputs": {
+    "result": "float",
+    "expression": "string",
+    "normalized": "string"
+  },
+  "tags": [
+    "math",
+    "arithmetic",
+    "calculate",
+    "compute",
+    "deterministic",
+    "offline"
+  ],
   "deterministic": true,
   "timeout_s": 10,
   "cache_ttl_s": 86400,
-  "price_estimate_usd": 0.0
+  "price_estimate_usd": 0.0,
+  "provides": [
+    "number.result"
+  ],
+  "requires": []
 }
