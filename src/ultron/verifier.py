@@ -23,9 +23,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .breaker import BreakerResult, BreakerVerifier
 from .cache import Cache, make_key
 from .config import Settings, get_settings
 from .llm import LLMClient
+from .provenance import ProvenanceEnvelope
 from .registry import TYPE_MAP, ToolManifest
 
 REFUSAL_MARKERS = (
@@ -113,6 +115,8 @@ class VerificationResult:
     judge_used: bool = False
     cost_usd: float = 0.0
     cached: bool = False
+    untrusted: bool = False
+    breaker: BreakerResult | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +126,8 @@ class VerificationResult:
             "judge_used": self.judge_used,
             "cost_usd": self.cost_usd,
             "cached": self.cached,
+            "untrusted": self.untrusted,
+            "breaker": self.breaker.as_dict() if self.breaker else None,
             "checks": [
                 {"name": c.name, "status": c.status, "detail": c.detail} for c in self.checks
             ],
@@ -144,10 +150,12 @@ class Verifier:
         cache: Cache | None = None,
         llm: LLMClient | None = None,
         settings: Settings | None = None,
+        breaker: BreakerVerifier | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.cache = cache or Cache(self.settings)
         self.llm = llm or LLMClient(self.cache, self.settings)
+        self.breaker = breaker or BreakerVerifier()
 
     def verify(
         self,
@@ -157,6 +165,7 @@ class Verifier:
         goal: str = "",
         evidence: list[str] | None = None,
         run_id: str = "",
+        provenance: list[ProvenanceEnvelope] | None = None,
     ) -> VerificationResult:
         checks: list[Check] = []
         checks.append(self._check_payload(result))
@@ -172,12 +181,26 @@ class Verifier:
         if evidence:
             checks.append(self._check_grounding(result, evidence))
 
+        breaker_result: BreakerResult | None = None
+        if provenance is not None:
+            breaker_result = self.breaker.verify(result, provenance)
+            checks.append(
+                Check(
+                    "breaker.provenance",
+                    "pass" if breaker_result.ok else "fail",
+                    breaker_result.reason,
+                )
+            )
         verdict = self._finalize(checks)
+        verdict.breaker = breaker_result
+        verdict.untrusted = bool(breaker_result and breaker_result.untrusted)
         if self.settings.enable_llm_judge and verdict.ok and _has_free_text(result):
             judge = self._judge(goal, result, evidence or [])
             checks.extend(judge.checks)
             verdict = self._finalize(checks)
             verdict.cost_usd = judge.cost_usd
+            verdict.breaker = breaker_result
+            verdict.untrusted = bool(breaker_result and breaker_result.untrusted)
         return verdict
 
     # ------------------------------------------------------------------- checks

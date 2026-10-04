@@ -25,7 +25,8 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
-from .cache import Cache
+from .breaker import BreakerVerifier
+from .cache import Cache, make_key
 from .config import Settings, get_settings
 from .errors import (
     BudgetExceeded,
@@ -38,12 +39,21 @@ from .llm import LLMClient
 from .memory import Memory, RunRecord
 from .planner import Plan, Planner, PlanStep
 from .policy import PolicyDecision, PolicyGate, PolicyRequest
+from .provenance import ProvenanceEnvelope
 from .registry import Registry
 from .router import RouteDecision, Router
 from .sandbox import Sandbox, SandboxResult
 from .verifier import VerificationResult, Verifier
 
-RunStatus = Literal["ok", "denied", "failed", "budget_exceeded", "verification_failed", "no_plan"]
+RunStatus = Literal[
+    "ok",
+    "denied",
+    "failed",
+    "budget_exceeded",
+    "verification_failed",
+    "ungrounded_rejection",
+    "no_plan",
+]
 AnswerSource = Literal["tools", "memory", "direct", "synthesis", "none"]
 
 
@@ -143,10 +153,11 @@ class StepReport:
     verification: VerificationResult | None = None
     error: str | None = None
     result: dict[str, Any] | None = None
+    provenance: list[ProvenanceEnvelope] = field(default_factory=list)
     #: Why the step failed, so the run status is honest:
     #: policy (refused), sandbox (environment/execution), tool (bad output),
-    #: verification (output rejected) or none.
-    failure_kind: Literal["none", "policy", "sandbox", "tool", "verification"] = "none"
+    #: verification (output rejected), breaker (ungrounded) or none.
+    failure_kind: Literal["none", "policy", "sandbox", "tool", "verification", "breaker"] = "none"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -166,6 +177,7 @@ class StepReport:
             "error": self.error,
             "failure_kind": self.failure_kind,
             "result": self.result,
+            "provenance": [item.as_dict() for item in self.provenance],
         }
 
 
@@ -181,6 +193,7 @@ class AgentResult:
     plan: Plan | None = None
     #: Ordered capability chain selected by the planner, if any.
     chain: list[str] = field(default_factory=list)
+    provenance: list[ProvenanceEnvelope] = field(default_factory=list)
     steps: list[StepReport] = field(default_factory=list)
     budget: Budget | None = None
     cost_usd: float = 0.0
@@ -209,6 +222,7 @@ class AgentResult:
             "route": self.route.as_dict() if self.route else None,
             "plan": self.plan.as_dict() if self.plan else None,
             "chain": self.chain,
+            "provenance": [item.as_dict() for item in self.provenance],
             "steps": [s.as_dict() for s in self.steps],
             "budget": self.budget.as_dict() if self.budget else None,
             "cost_usd": round(self.cost_usd, 8),
@@ -249,6 +263,7 @@ class Agent:
         llm: LLMClient | None = None,
         gate: PolicyGate | None = None,
         sandbox: Sandbox | None = None,
+        breaker: BreakerVerifier | None = None,
         run_id: str | None = None,
         interactive: bool = False,
         use_memory_recall: bool = True,
@@ -260,6 +275,7 @@ class Agent:
         self.cache = cache or Cache(self.settings, run_id=self.run_id)
         self.memory = memory or Memory(self.settings)
         self.llm = llm or LLMClient(self.cache, self.settings)
+        self.breaker = breaker or BreakerVerifier()
         self.gate = gate or PolicyGate(self.settings, run_id=self.run_id)
         self.sandbox = sandbox or Sandbox(
             self.settings, backend=sandbox_backend, cache=self.cache, run_id=self.run_id
@@ -268,7 +284,12 @@ class Agent:
         self.planner = Planner(
             self.registry, cache=self.cache, llm=self.llm, settings=self.settings
         )
-        self.verifier = Verifier(cache=self.cache, llm=self.llm, settings=self.settings)
+        self.verifier = Verifier(
+            cache=self.cache,
+            llm=self.llm,
+            settings=self.settings,
+            breaker=self.breaker,
+        )
         self.interactive = interactive
         self.use_memory_recall = use_memory_recall
 
@@ -341,6 +362,7 @@ class Agent:
                 executable_step = self._materialize_chain_step(step, result.steps)
                 report = self._execute_step(run_id, executable_step, goal, budget)
                 result.steps.append(report)
+                result.provenance.extend(report.provenance)
                 if not report.ok:
                     if report.failure_kind == "policy":
                         result.status = "denied"
@@ -352,6 +374,8 @@ class Agent:
                                 "reason": report.policy_reason,
                             }
                         )
+                    elif report.failure_kind == "breaker":
+                        result.status = "ungrounded_rejection"
                     elif report.failure_kind == "verification":
                         result.status = "verification_failed"
                     else:  # sandbox / tool failure: an execution problem, not a policy one
@@ -366,6 +390,22 @@ class Agent:
             answer, source = self._answer(result, goal, budget)
             result.answer = answer
             result.answer_source = source
+            final_provenance = list(result.provenance)
+            if source == "synthesis":
+                final_provenance.append(
+                    ProvenanceEnvelope.llm_output(
+                        f"llm:{make_key(goal, answer)[:32]}",
+                        answer,
+                    )
+                )
+            final_breaker = self.breaker.verify({"answer": answer}, final_provenance)
+            if not final_breaker.ok:
+                result.status = "ungrounded_rejection"
+                result.ok = False
+                result.notes.append(f"breaker rejected final answer: {final_breaker.reason}")
+                result.provenance = final_provenance
+                return self._finalize(result, run_id=run_id, started=started)
+            result.provenance = final_provenance
             result.status = "ok"
             result.ok = True
             budget.check()
@@ -467,7 +507,12 @@ class Agent:
         # --- sandbox -------------------------------------------------------
         start = time.perf_counter()
         try:
-            outcome: SandboxResult = self.sandbox.run(manifest, step.inputs, decision)
+            outcome: SandboxResult = self.sandbox.run(
+                manifest,
+                step.inputs,
+                decision,
+                defer_cache_write=True,
+            )
         except (SandboxError, SandboxUnavailable) as exc:
             report.error = f"sandbox error: {exc}"
             report.failure_kind = "sandbox"
@@ -490,17 +535,36 @@ class Agent:
         report.duration_s = outcome.duration_s
         report.result = outcome.result
         report.error = outcome.error
+        report.provenance = list(outcome.provenance)
 
         # --- verify --------------------------------------------------------
         verification: VerificationResult | None = None
         if outcome.ok and outcome.result is not None:
-            verification = self.verifier.verify(manifest, outcome.result, goal=goal, run_id=run_id)
+            verification = self.verifier.verify(
+                manifest,
+                outcome.result,
+                goal=goal,
+                run_id=run_id,
+                provenance=outcome.provenance,
+            )
             report.verification = verification
             if verification.cost_usd:
                 budget.charge(usd=verification.cost_usd, llm_calls=1)
         report.ok = bool(outcome.ok and (verification.ok if verification else False))
+        if report.ok:
+            for item in outcome.provenance:
+                if item.origin in {"sandbox_tool", "web_fetch"}:
+                    item.verified = True
+            self.sandbox.commit_cache(outcome)
         if not report.ok:
-            if verification is not None and not verification.ok:
+            if (
+                verification is not None
+                and verification.breaker is not None
+                and not verification.breaker.ok
+            ):
+                report.failure_kind = "breaker"
+                report.error = report.error or verification.breaker.reason
+            elif verification is not None and not verification.ok:
                 report.failure_kind = "verification"
                 report.error = report.error or verification.reason
             elif not report.error:
@@ -642,7 +706,9 @@ class Agent:
         result.cost_usd = round((result.budget.spent_usd if result.budget else 0.0), 8)
         result.cost_basis = self._cost_basis()
 
-        if run_id and not recalled:
+        if run_id and not recalled and result.status == "ungrounded_rejection":
+            self.memory.discard_run(run_id)
+        elif run_id and not recalled:
             self.memory.finish_run(
                 RunRecord(
                     run_id=run_id,

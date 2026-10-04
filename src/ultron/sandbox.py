@@ -44,6 +44,11 @@ from .cache import Cache, make_key
 from .config import Settings, get_settings
 from .errors import SandboxError, SandboxUnavailable
 from .policy import PolicyDecision, scrub_env
+from .provenance import (
+    ProvenanceEnvelope,
+    deserialize_envelopes,
+    serialize_envelopes,
+)
 from .registry import ToolManifest
 
 Backend = Literal["docker", "local"]
@@ -108,6 +113,10 @@ class SandboxResult:
     run_id: str = ""
     container: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
+    provenance: list[ProvenanceEnvelope] = field(default_factory=list)
+    # Populated for deferred writes; the Agent commits only after verification.
+    cache_key: str = ""
+    cache_ttl_s: float | None = None
 
     @property
     def cacheable(self) -> bool:
@@ -137,6 +146,7 @@ class SandboxResult:
             "network": self.network,
             "docker_network": self.docker_network,
             "meta": self.meta,
+            "provenance": serialize_envelopes(self.provenance),
         }
 
 
@@ -519,6 +529,7 @@ class Sandbox:
         decision: PolicyDecision,
         *,
         use_cache: bool = True,
+        defer_cache_write: bool = False,
     ) -> SandboxResult:
         """Execute ``manifest`` with ``inputs`` under a granted policy decision."""
         if not decision.allowed:
@@ -528,6 +539,10 @@ class Sandbox:
         backend = self.ensure_backend()
 
         cache_key = make_key("tool", manifest.content_hash, inputs, decision.network)
+        input_provenance = ProvenanceEnvelope.user_input(
+            inputs,
+            source_id=f"input:{manifest.key}:{make_key(inputs)[:32]}",
+        )
         ttl = (
             manifest.cache_ttl_s
             if manifest.cache_ttl_s is not None
@@ -537,6 +552,25 @@ class Sandbox:
             entry = self.cache.get("tool", cache_key)
             if entry is not None:
                 payload = dict(entry.value)
+                upstream = deserialize_envelopes(payload.get("provenance"))
+                if not upstream:
+                    # Pre-provenance cache rows are usable as raw evidence, but
+                    # remain unverified until the normal verifier runs again.
+                    upstream = [
+                        ProvenanceEnvelope.tool_output(
+                            manifest.key,
+                            manifest.content_hash,
+                            payload.get("result"),
+                            verified=False,
+                            metadata={"ok": payload.get("ok", False)},
+                        )
+                    ]
+                cache_provenance = ProvenanceEnvelope.cache_hit(
+                    cache_key,
+                    payload.get("result"),
+                    verified=False,
+                    upstream=upstream,
+                )
                 return SandboxResult(
                     tool=manifest.name,
                     version=manifest.version,
@@ -550,6 +584,7 @@ class Sandbox:
                     docker_network=docker_network_mode(decision.network),
                     run_id=self.run_id,
                     meta={"cache_age_s": round(entry.age_s, 2), **payload.get("meta", {})},
+                    provenance=[input_provenance, cache_provenance, *upstream],
                 )
 
         argv = shlex.split(manifest.entrypoint)
@@ -568,22 +603,52 @@ class Sandbox:
         else:
             outcome = self._run_local(manifest, inputs, argv, decision)
         outcome.duration_s = round(time.perf_counter() - start, 4)
+        output_origin = "web_fetch" if manifest.wants_network else "sandbox_tool"
+        output_provenance = ProvenanceEnvelope.tool_output(
+            manifest.key,
+            manifest.content_hash,
+            outcome.result,
+            verified=False,
+            origin=output_origin,
+            metadata={
+                "ok": outcome.ok,
+                "error": outcome.error,
+                "raw_stdout": outcome.stdout,
+                "raw_stderr": outcome.stderr,
+            },
+        )
+        outcome.provenance = [input_provenance, output_provenance]
+        outcome.cache_key = cache_key
+        outcome.cache_ttl_s = float(ttl)
 
-        if use_cache and ttl > 0 and outcome.cacheable:
-            self.cache.set(
-                "tool",
-                cache_key,
-                {
-                    "ok": outcome.ok,
-                    "exit_code": outcome.exit_code,
-                    "result": outcome.result,
-                    "backend": outcome.backend,
-                    "docker_network": outcome.docker_network,
-                    "meta": outcome.meta,
-                },
-                ttl_s=ttl,
-            )
+        if use_cache and not defer_cache_write:
+            self.commit_cache(outcome)
         return outcome
+
+    def commit_cache(self, outcome: SandboxResult) -> bool:
+        """Write a tool result only after its caller has verified it.
+
+        The default low-level Sandbox API keeps its historical eager-cache
+        behaviour for compatibility. Agent executions pass ``defer_cache_write``
+        and call this method only after Verifier plus Breaker approval.
+        """
+        if not outcome.cache_key or outcome.cache_ttl_s is None or not outcome.cacheable:
+            return False
+        self.cache.set(
+            "tool",
+            outcome.cache_key,
+            {
+                "ok": outcome.ok,
+                "exit_code": outcome.exit_code,
+                "result": outcome.result,
+                "backend": outcome.backend,
+                "docker_network": outcome.docker_network,
+                "meta": outcome.meta,
+                "provenance": serialize_envelopes(outcome.provenance),
+            },
+            ttl_s=outcome.cache_ttl_s,
+        )
+        return True
 
     # --------------------------------------------------------------- tool env
     def _container_path(self, host_path: str) -> str:
