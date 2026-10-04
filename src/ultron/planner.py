@@ -18,13 +18,14 @@ tool name can therefore never reach the sandbox.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .cache import Cache, make_key
 from .config import Settings, get_settings
 from .llm import LLMClient
-from .registry import TYPE_MAP, Registry, ToolManifest
+from .registry import TYPE_MAP, Registry, RiskTier, ToolManifest
 from .router import RouteDecision
 
 URL_RE = re.compile(r"https?://[^\s\"')>]+", re.I)
@@ -50,6 +51,9 @@ class PlanStep:
     expected_outputs: dict[str, str] = field(default_factory=dict)
     est_cost_usd: float = 0.0
     deterministic: bool = True
+    #: Index of the preceding step whose verified result supplies this step.
+    #: Inputs are materialized by Agent immediately before the policy gate.
+    chain_input: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +65,7 @@ class PlanStep:
             "inputs": self.inputs,
             "est_cost_usd": self.est_cost_usd,
             "deterministic": self.deterministic,
+            "chain_input": self.chain_input,
         }
 
 
@@ -75,6 +80,8 @@ class Plan:
     cost_usd: float = 0.0
     resolved: bool = True
     notes: list[str] = field(default_factory=list)
+    #: Ordered capability chain, empty for ordinary single-tool plans.
+    chain: list[str] = field(default_factory=list)
 
     @property
     def est_cost_usd(self) -> float:
@@ -94,6 +101,7 @@ class Plan:
             "cost_usd": self.cost_usd,
             "resolved": self.resolved,
             "notes": self.notes,
+            "chain": self.chain,
             "est_cost_usd": self.est_cost_usd,
             "steps": [s.as_dict() for s in self.steps],
         }
@@ -109,17 +117,42 @@ class Planner:
         cache: Cache | None = None,
         llm: LLMClient | None = None,
         settings: Settings | None = None,
+        risk_ceiling: RiskTier | str = RiskTier.LOW,
     ) -> None:
         self.settings = settings or get_settings()
         self.registry = registry
         self.cache = cache or Cache(self.settings)
         self.llm = llm or LLMClient(self.cache, self.settings)
         self.use_llm = bool(_flag("ULTRON_PLANNER_USE_LLM"))
+        self.risk_ceiling = _risk_value(risk_ceiling)
 
     # --------------------------------------------------------------- entry point
-    def plan(self, goal: str, route: RouteDecision | None = None) -> Plan:
+    def plan(
+        self,
+        goal: str,
+        route: RouteDecision | None = None,
+        *,
+        start_types: Iterable[str] | None = None,
+        goal_types: Iterable[str] | None = None,
+        risk_ceiling: RiskTier | str | None = None,
+    ) -> Plan:
         depth = route.plan_depth if route else 1
-        cache_key = make_key("plan", goal.strip().lower(), depth, self.registry.fingerprint)
+        explicit_start = tuple(sorted(set(start_types or ())))
+        explicit_goal = tuple(sorted(set(goal_types or ())))
+        ceiling = _risk_value(risk_ceiling) if risk_ceiling is not None else self.risk_ceiling
+        inferred_start, inferred_goal = self._infer_capability_types(goal)
+        effective_start = explicit_start or tuple(sorted(inferred_start))
+        effective_goal = explicit_goal or tuple(sorted(inferred_goal))
+        cache_key = make_key(
+            "plan",
+            "capability-graph-v1",
+            goal.strip().lower(),
+            depth,
+            self.registry.fingerprint,
+            effective_start,
+            effective_goal,
+            ceiling,
+        )
         entry = self.cache.get("plan", cache_key)
         if entry is not None:
             payload = dict(entry.value)
@@ -127,10 +160,18 @@ class Planner:
             payload["created_by"] = "cache"
             payload["cost_usd"] = 0.0
             payload["steps"] = [PlanStep(**s) for s in payload["steps"]]
+            payload.setdefault("chain", [])
             return Plan(**payload)
 
-        plan = self._deterministic(goal, depth)
-        if self.use_llm and depth >= 2 and not self.llm.offline:
+        plan = self._deterministic(
+            goal,
+            depth,
+            start_types=effective_start,
+            goal_types=effective_goal,
+            risk_ceiling=ceiling,
+            explicit_capabilities=bool(explicit_start or explicit_goal),
+        )
+        if self.use_llm and depth >= 2 and not self.llm.offline and not plan.chain:
             plan = self._maybe_llm_upgrade(goal, plan)
 
         self.cache.set(
@@ -143,6 +184,7 @@ class Planner:
                 "created_by": plan.created_by,
                 "resolved": plan.resolved,
                 "notes": plan.notes,
+                "chain": plan.chain,
                 "steps": [s.as_dict() for s in plan.steps],
             },
             ttl_s=self.settings.cache_ttl_llm,
@@ -150,7 +192,16 @@ class Planner:
         return plan
 
     # ----------------------------------------------------------- deterministic
-    def _deterministic(self, goal: str, depth: int) -> Plan:
+    def _deterministic(
+        self,
+        goal: str,
+        depth: int,
+        *,
+        start_types: Iterable[str] = (),
+        goal_types: Iterable[str] = (),
+        risk_ceiling: str = "low",
+        explicit_capabilities: bool = False,
+    ) -> Plan:
         text = (goal or "").strip()
         urls = URL_RE.findall(text)
         notes: list[str] = []
@@ -199,6 +250,29 @@ class Planner:
             elif not steps:
                 notes.append("no registry tool matched the goal")
 
+        # A single-tool plan remains exactly as before. Capability composition is
+        # only a fallback (or an explicitly requested capability plan), so adding
+        # optional semantic metadata cannot perturb Phase 1 routing.
+        chain: list[str] = []
+        if goal_types and (not steps or explicit_capabilities):
+            chain = self.registry.find_chain(
+                start_types,
+                goal_types,
+                risk_ceiling=risk_ceiling,
+            )
+            if chain:
+                steps = self._chain_steps(chain, text)
+                notes = [
+                    note for note in notes if not note.startswith("could not derive inputs for ")
+                ]
+                notes.append(f"capability chain selected: {' -> '.join(chain)}")
+            elif explicit_capabilities:
+                unrestricted = self.registry.find_chain(start_types, goal_types)
+                if unrestricted:
+                    notes.append(f"capability chain refused: exceeds {risk_ceiling} risk ceiling")
+                else:
+                    notes.append("no capability chain exists for the requested types")
+
         resolved = bool(steps)
         if not resolved:
             notes.append("plan is unresolved: the agent will answer without tools")
@@ -209,6 +283,7 @@ class Planner:
             rationale=f"deterministic plan from registry ({len(steps)} step(s)), zero planner tokens",
             resolved=resolved,
             notes=notes,
+            chain=chain,
         )
 
     def _zero_step_plan(self, goal: str) -> list[PlanStep]:
@@ -226,7 +301,13 @@ class Planner:
 
     # ------------------------------------------------------------------ helpers
     def _step(
-        self, index: int, manifest: ToolManifest, inputs: dict[str, Any], reason: str
+        self,
+        index: int,
+        manifest: ToolManifest,
+        inputs: dict[str, Any],
+        reason: str,
+        *,
+        chain_input: int | None = None,
     ) -> PlanStep:
         return PlanStep(
             index=index,
@@ -238,7 +319,79 @@ class Planner:
             expected_outputs=dict(manifest.outputs),
             est_cost_usd=float(manifest.price_estimate_usd),
             deterministic=manifest.deterministic,
+            chain_input=chain_input,
         )
+
+    def _chain_steps(self, chain: list[str], goal: str) -> list[PlanStep]:
+        steps: list[PlanStep] = []
+        for index, name in enumerate(chain):
+            manifest = self.registry.get(name)
+            inputs = self._inputs_for(manifest, goal) or {}
+            steps.append(
+                self._step(
+                    index,
+                    manifest,
+                    inputs,
+                    f"capability chain step {index + 1}/{len(chain)}",
+                    chain_input=index - 1 if index else None,
+                )
+            )
+        return steps
+
+    def _infer_capability_types(self, goal: str) -> tuple[set[str], set[str]]:
+        """Infer capability endpoints from declared types without inventing names.
+
+        Exact ``from pdf.bytes to table.csv`` syntax is preferred. For ordinary
+        language, match a declared type's meaningful components (``pdf`` and
+        ``table``) against the source and target sides of ``to``/``into``/``as``.
+        Initial types are biased toward values no registered tool produces; this
+        keeps ``pdf.bytes`` from being confused with the intermediate ``pdf.text``.
+        If the wording is still ambiguous, return no endpoints and fail closed.
+        """
+        manifests = self.registry.latest()
+        declared_requires = {
+            semantic_type for manifest in manifests for semantic_type in manifest.requires
+        }
+        declared_provides = {
+            semantic_type for manifest in manifests for semantic_type in manifest.provides
+        }
+        declared = declared_requires | declared_provides
+        mentioned = set(re.findall(r"[a-z][a-z0-9_-]*\.[a-z][a-z0-9_.-]*", goal.lower()))
+        exact = mentioned.intersection(declared)
+        direction = re.search(r"\b(?:to|into|as)\b", goal.lower())
+        reverse_direction = re.search(r"\bfrom\b", goal.lower())
+        if direction:
+            source_text, target_text = goal[: direction.start()], goal[direction.end() :]
+        elif reverse_direction:
+            # "extract a table from a pdf" names the desired output first.
+            target_text, source_text = (
+                goal[: reverse_direction.start()],
+                goal[reverse_direction.end() :],
+            )
+        else:
+            source_text = target_text = goal
+
+        def matches(semantic_type: str, text: str) -> bool:
+            parts = [part for part in re.split(r"[._-]+", semantic_type.lower()) if len(part) > 2]
+            words = set(re.findall(r"[a-z0-9]+", text.lower()))
+            return bool(parts) and any(part in words for part in parts)
+
+        if exact:
+            # Preserve explicit endpoints when both sides are named.
+            starts = {value for value in exact if value in declared_requires}
+            goals = {value for value in exact if value in declared_provides}
+            if starts and goals:
+                return starts, goals
+
+        starts = {
+            value
+            for value in declared_requires
+            if matches(value, source_text) and value not in declared_provides
+        }
+        goals = {value for value in declared_provides if matches(value, target_text)}
+        if len(starts) == 1 and len(goals) == 1:
+            return starts, goals
+        return set(), set()
 
     def _pick(self, candidates: list[ToolManifest], *, exclude: set[str]) -> ToolManifest | None:
         for manifest in candidates:
@@ -390,3 +543,10 @@ def _flag(name: str) -> bool:
     import os
 
     return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _risk_value(risk: RiskTier | str) -> str:
+    value = risk.value if isinstance(risk, RiskTier) else str(risk).lower()
+    if value not in {"low", "medium", "high"}:
+        raise ValueError(f"unknown risk ceiling {risk!r}")
+    return value

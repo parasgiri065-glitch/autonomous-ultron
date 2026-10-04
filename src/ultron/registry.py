@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -179,6 +179,10 @@ class ToolManifest(BaseModel):
     entrypoint: str
     risk: RiskTier
     description: str = ""
+    #: Semantic values emitted and consumed by this tool. These are optional so
+    #: Phase 1 manifests remain valid and keep their single-tool behaviour.
+    provides: list[str] = Field(default_factory=list)
+    requires: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     inputs: dict[str, str] = Field(default_factory=dict)
     outputs: dict[str, str] = Field(default_factory=dict)
@@ -232,6 +236,18 @@ class ToolManifest(BaseModel):
             if typ not in TYPE_MAP:
                 raise ManifestError(f"unsupported type {typ!r} for field {key!r}")
         return v
+
+    @field_validator("provides", "requires")
+    @classmethod
+    def _check_semantic_types(cls, v: list[str]) -> list[str]:
+        if len(v) != len(set(v)):
+            raise ManifestError("provides/requires must not contain duplicate semantic types")
+        for semantic_type in v:
+            if not isinstance(semantic_type, str) or not semantic_type.strip():
+                raise ManifestError("semantic types must be non-empty strings")
+            if any(char.isspace() for char in semantic_type) or len(semantic_type) > 128:
+                raise ManifestError(f"invalid semantic type {semantic_type!r}")
+        return [semantic_type.strip() for semantic_type in v]
 
     @field_validator("permissions")
     @classmethod
@@ -303,6 +319,8 @@ class ToolManifest(BaseModel):
             self.outputs,
             self.description,
             sorted(self.tags),
+            sorted(self.provides),
+            sorted(self.requires),
             self.deterministic,
             self.timeout_s,
             self.cache_ttl_s,
@@ -313,17 +331,29 @@ class ToolManifest(BaseModel):
         return f"{self.key} risk={self.risk.value} perms={self.permissions or ['none']}"
 
 
+def _risk_rank(risk: RiskTier | str) -> int:
+    value = risk.value if isinstance(risk, RiskTier) else str(risk).lower()
+    try:
+        return {"low": 0, "medium": 1, "high": 2}[value]
+    except KeyError as exc:
+        raise ManifestError(f"unknown risk ceiling {risk!r}") from exc
+
+
 @dataclass(slots=True)
 class RegistryIndex:
-    """Cheap, LLM-free relevance index used by the planner."""
+    """Cheap, LLM-free relevance and capability indexes used by the planner."""
 
     terms: dict[str, list[str]] = field(default_factory=dict)
     by_tag: dict[str, list[str]] = field(default_factory=dict)
+    by_provides: dict[str, list[str]] = field(default_factory=dict)
+    by_requires: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def build(cls, manifests: list[ToolManifest]) -> RegistryIndex:
         terms: dict[str, list[str]] = {}
         by_tag: dict[str, list[str]] = {}
+        by_provides: dict[str, list[str]] = {}
+        by_requires: dict[str, list[str]] = {}
         for m in manifests:
             blob = f"{m.name} {m.description} {' '.join(m.tags)}"
             tokens = _tokens(blob)
@@ -337,7 +367,16 @@ class RegistryIndex:
                 terms.setdefault(token, []).append(m.key)
             for tag in m.tags:
                 by_tag.setdefault(tag.lower(), []).append(m.key)
-        return cls(terms=terms, by_tag=by_tag)
+            for semantic_type in m.provides:
+                by_provides.setdefault(semantic_type, []).append(m.key)
+            for semantic_type in m.requires:
+                by_requires.setdefault(semantic_type, []).append(m.key)
+        return cls(
+            terms=terms,
+            by_tag=by_tag,
+            by_provides=by_provides,
+            by_requires=by_requires,
+        )
 
 
 class Registry:
@@ -443,6 +482,83 @@ class Registry:
             self._index = RegistryIndex.build(self.latest())
         return self._index
 
+    def graph(self) -> dict[str, list[str]]:
+        """Return the deterministic tool-capability adjacency map.
+
+        Nodes are latest tool names. An edge ``A -> B`` exists when a semantic
+        type emitted by A is required by B. The map deliberately contains only
+        registered tools, never names fabricated by a planner or an LLM.
+        """
+        manifests = {manifest.name: manifest for manifest in self.latest()}
+        adjacency: dict[str, list[str]] = {name: [] for name in sorted(manifests)}
+        for source_name in sorted(manifests):
+            source = manifests[source_name]
+            emitted = set(source.provides)
+            if not emitted:
+                continue
+            adjacency[source_name] = sorted(
+                target_name
+                for target_name, target in manifests.items()
+                if target_name != source_name and emitted.intersection(target.requires)
+            )
+        return adjacency
+
+    def find_chain(
+        self,
+        start_types: Iterable[str],
+        goal_types: Iterable[str],
+        *,
+        risk_ceiling: RiskTier | str | None = None,
+    ) -> list[str]:
+        """Find the shortest deterministic capability chain with BFS.
+
+        ``start_types`` is the set of values already available. A tool can be
+        applied only when all its ``requires`` are available; its ``provides``
+        are then added to the available set. Each tool name is used at most once,
+        which both detects cycles and prevents a cyclic graph from hanging the
+        planner. Ties are resolved lexicographically by the ordered tool names.
+
+        ``risk_ceiling`` is an optional planner-side filter. Policy still checks
+        every resulting step independently at execution time.
+        """
+        available_start = frozenset(str(value) for value in start_types)
+        goals = frozenset(str(value) for value in goal_types)
+        if not goals or goals.issubset(available_start):
+            return []
+
+        manifests = {manifest.name: manifest for manifest in self.latest()}
+        ceiling = _risk_rank(risk_ceiling) if risk_ceiling is not None else None
+        frontier: list[tuple[frozenset[str], tuple[str, ...]]] = [(available_start, ())]
+        # The available-type set plus used-tool set is the complete BFS state.
+        # Keep every first visit; sorted expansion makes equal-length choices
+        # deterministic without relying on filesystem order.
+        visited: set[tuple[frozenset[str], frozenset[str]]] = set()
+
+        while frontier:
+            available, path = frontier.pop(0)
+            state = (available, frozenset(path))
+            if state in visited:
+                continue
+            visited.add(state)
+            for name in sorted(manifests):
+                if name in path:
+                    continue  # explicit cycle/repeated-tool guard
+                manifest = manifests[name]
+                if ceiling is not None and _risk_rank(manifest.risk) > ceiling:
+                    continue
+                required = frozenset(manifest.requires)
+                provided = frozenset(manifest.provides)
+                if not provided or not required.issubset(available):
+                    continue
+                new_available = available | provided
+                if new_available == available:
+                    continue  # no progress: do not create useless cycles
+                new_path = (*path, name)
+                if goals.issubset(new_available):
+                    return list(new_path)
+                frontier.append((new_available, new_path))
+        return []
+
     def snapshot(self) -> dict[str, Any]:
         """Compact, LLM-friendly description of available tools."""
         return {
@@ -456,6 +572,8 @@ class Registry:
                     "tags": m.tags,
                     "inputs": m.inputs,
                     "outputs": m.outputs,
+                    "provides": m.provides,
+                    "requires": m.requires,
                     "network": m.wants_network,
                     "deterministic": m.deterministic,
                 }

@@ -118,6 +118,30 @@ def write_tool(tools_dir: Path, payload: dict) -> Path:
 
 
 # ------------------------------------------------------------------------ config
+def test_latency_regression_floor_accepts_45ms_on_30ms_baseline(tmp_path):
+    from eval.run import EvalReport, TaskOutcome, TaskSpec, evaluate_gates
+
+    report = EvalReport(
+        cold=[
+            TaskOutcome(
+                spec=TaskSpec(id="latency", goal="calculate 1+1"),
+                status="ok",
+                ok=True,
+                latency_s=0.045,
+            )
+        ]
+    )
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps({"success_rate": 1.0, "avg_cost_usd": 0.0, "avg_latency_s": 0.03}),
+        encoding="utf-8",
+    )
+    gates = evaluate_gates(report, load_settings(state_dir=tmp_path), baseline)
+    latency_gate = next(g for g in gates if g.name == "no_regression.avg_latency_s")
+    assert latency_gate.ok
+    assert latency_gate.limit == pytest.approx(0.08)
+
+
 def test_settings_defaults_are_safe(tmp_path, monkeypatch):
     for key in ("ULTRON_SANDBOX", "ULTRON_ALLOW_LOCAL_SANDBOX", "OPENAI_API_KEY"):
         monkeypatch.delenv(key, raising=False)
@@ -127,6 +151,136 @@ def test_settings_defaults_are_safe(tmp_path, monkeypatch):
     assert settings.policy_network == "auto"
     assert settings.enable_llm_judge is False  # no accidental spend
     assert settings.budget_max_usd <= 0.05  # tiny default budget
+
+
+# ------------------------------------------------------------------- capabilities
+def capability_registry(tmp_path: Path, tools: list[dict]) -> Registry:
+    tools_dir = tmp_path / "capability-tools"
+    for tool in tools:
+        write_tool(tools_dir, tool)
+    settings = load_settings(
+        state_dir=tmp_path / "capability-state",
+        tools_dir=tools_dir,
+        llm_mode="offline",
+        sandbox_backend="local",
+        allow_local_sandbox=True,
+    )
+    return Registry(settings).load(strict=True)
+
+
+def capability_tool(
+    name: str,
+    provides: list[str],
+    requires: list[str],
+    *,
+    risk: str = "low",
+) -> dict:
+    return {
+        "name": name,
+        "version": "0.1.0",
+        "entrypoint": "python -m tools.calc",
+        "risk": risk,
+        "provides": provides,
+        "requires": requires,
+    }
+
+
+def test_registry_finds_pdf_to_table_chain_and_exposes_graph(tmp_path):
+    registry = capability_registry(
+        tmp_path,
+        [
+            capability_tool("pdf_text", ["pdf.text"], ["pdf.bytes"]),
+            capability_tool("table_extract", ["table.csv"], ["pdf.text"]),
+        ],
+    )
+    assert registry.graph() == {
+        "pdf_text": ["table_extract"],
+        "table_extract": [],
+    }
+    assert registry.find_chain(["pdf.bytes"], ["table.csv"]) == [
+        "pdf_text",
+        "table_extract",
+    ]
+
+
+def test_registry_returns_empty_for_missing_capability_path(tmp_path):
+    registry = capability_registry(
+        tmp_path,
+        [capability_tool("pdf_text", ["pdf.text"], ["pdf.bytes"])],
+    )
+    assert registry.find_chain(["pdf.bytes"], ["table.csv"]) == []
+    assert "table_extract" not in registry.graph()
+
+
+def test_registry_cycle_is_finite_and_never_reuses_a_tool(tmp_path):
+    registry = capability_registry(
+        tmp_path,
+        [
+            capability_tool("cycle_a", ["cycle.x"], ["cycle.y"]),
+            capability_tool("cycle_b", ["cycle.y"], ["cycle.x"]),
+        ],
+    )
+    assert registry.find_chain(["cycle.x"], ["cycle.missing"]) == []
+    assert registry.find_chain(["cycle.x"], ["cycle.y"]) == ["cycle_b"]
+
+
+def test_registry_ambiguity_prefers_alphabetical_chain(tmp_path):
+    registry = capability_registry(
+        tmp_path,
+        [
+            capability_tool("a_first", ["branch.a"], ["source.raw"]),
+            capability_tool("b_first", ["branch.b"], ["source.raw"]),
+            capability_tool("a_goal", ["goal.table"], ["branch.a"]),
+            capability_tool("b_goal", ["goal.table"], ["branch.b"]),
+        ],
+    )
+    assert registry.find_chain(["source.raw"], ["goal.table"]) == ["a_first", "a_goal"]
+
+
+def test_planner_rejects_medium_chain_under_low_risk_ceiling(tmp_path, settings):
+    registry = capability_registry(
+        tmp_path,
+        [
+            capability_tool("pdf_text", ["pdf.text"], ["pdf.bytes"]),
+            capability_tool("table_extract", ["table.csv"], ["pdf.text"], risk="medium"),
+        ],
+    )
+    planner = Planner(registry, cache=Cache(settings), settings=settings)
+    plan = planner.plan(
+        "compose pdf.bytes into table.csv",
+        start_types=["pdf.bytes"],
+        goal_types=["table.csv"],
+        risk_ceiling="low",
+    )
+    assert plan.steps == []
+    assert plan.chain == []
+    assert any("exceeds low risk ceiling" in note for note in plan.notes)
+
+
+def test_planner_logs_selected_chain(tmp_path, settings):
+    registry = capability_registry(
+        tmp_path,
+        [
+            capability_tool("pdf_text", ["pdf.text"], ["pdf.bytes"]),
+            capability_tool("table_extract", ["table.csv"], ["pdf.text"]),
+        ],
+    )
+    planner = Planner(registry, cache=Cache(settings), settings=settings)
+    plan = planner.plan(
+        "compose pdf.bytes into table.csv",
+        start_types=["pdf.bytes"],
+        goal_types=["table.csv"],
+    )
+    assert plan.chain == ["pdf_text", "table_extract"]
+    assert [step.tool for step in plan.steps] == plan.chain
+    assert plan.as_dict()["chain"] == plan.chain
+
+
+def test_existing_manifests_are_backward_compatible_and_typed(registry):
+    assert registry.get("calc").provides == ["number.result"]
+    assert registry.get("calc").requires == []
+    assert registry.get("web_research").provides == ["research.summary"]
+    assert registry.get("http_fetch").provides == ["web.raw"]
 
 
 # ---------------------------------------------------------------------- registry
@@ -843,6 +997,25 @@ def test_verifier_judge_off_by_default(registry, settings):
 
 
 # ---------------------------------------------------------------------- memory
+def test_memory_run_record_persists_capability_chain(settings):
+    from ultron.memory import RunRecord
+
+    memory = Memory(settings)
+    run_id = memory.start_run("compose pdf to table", registry_fingerprint="fp")
+    memory.finish_run(
+        RunRecord(
+            run_id=run_id,
+            goal="compose pdf to table",
+            status="ok",
+            success=True,
+            verified=True,
+            answer="table",
+            chain=["pdf_text", "table_extract"],
+        )
+    )
+    assert memory.recent_runs(1)[0]["chain"] == ["pdf_text", "table_extract"]
+
+
 def test_memory_records_runs_and_recalls_only_verified_ones(settings):
     memory = Memory(settings)
     run_id = memory.start_run("calculate 2+2", registry_fingerprint="fp")

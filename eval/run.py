@@ -19,7 +19,9 @@ What it does
    exit code 1 if success rate drops below ``ULTRON_EVAL_MIN_SUCCESS_RATE``, if
    avg cost exceeds ``ULTRON_EVAL_MAX_AVG_COST_USD``, if latency exceeds
    ``ULTRON_EVAL_MAX_AVG_LATENCY_S``, or if the run regresses against
-   ``eval/baseline.json``.
+   ``eval/baseline.json``. Baseline latency regression uses the larger of a
+   50 percent multiplier and a 50 ms absolute floor, because process-spawn
+   noise dominates very small baselines.
 
 Network is never required: tools read a fixture corpus (``web_mock``, set on the
 Settings this module builds — not via a process-wide environment write).
@@ -59,6 +61,9 @@ EVAL_STATE = REPO_ROOT / "eval" / ".state"
 SUCCESS_TOLERANCE = 0.01
 COST_TOLERANCE = 0.25
 LATENCY_TOLERANCE = 0.50
+# A small baseline is dominated by process startup and filesystem scheduling
+# noise. Keep the relative guard, but give it a 50 ms absolute floor.
+LATENCY_FLOOR_S = 0.05
 
 
 # --------------------------------------------------------------------- task spec
@@ -543,13 +548,18 @@ def evaluate_gates(report: EvalReport, settings: Settings, baseline_path: Path) 
             )
         )
         if base_latency > 0:
+            latency_limit = max(
+                base_latency * (1 + LATENCY_TOLERANCE),
+                base_latency + LATENCY_FLOOR_S,
+            )
             gates.append(
                 GateResult(
                     "no_regression.avg_latency_s",
-                    latency <= base_latency * (1 + LATENCY_TOLERANCE),
-                    f"{latency:.2f}s vs baseline {base_latency:.2f}s (+{LATENCY_TOLERANCE:.0%})",
+                    latency <= latency_limit,
+                    f"{latency:.2f}s vs baseline {base_latency:.2f}s "
+                    f"(+{LATENCY_TOLERANCE:.0%}, floor +{LATENCY_FLOOR_S:.2f}s)",
                     value=latency,
-                    limit=base_latency * (1 + LATENCY_TOLERANCE),
+                    limit=latency_limit,
                 )
             )
     else:

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from .cache import Cache
@@ -179,6 +179,8 @@ class AgentResult:
     answer_source: AnswerSource = "none"
     route: RouteDecision | None = None
     plan: Plan | None = None
+    #: Ordered capability chain selected by the planner, if any.
+    chain: list[str] = field(default_factory=list)
     steps: list[StepReport] = field(default_factory=list)
     budget: Budget | None = None
     cost_usd: float = 0.0
@@ -206,6 +208,7 @@ class AgentResult:
             "answer_source": self.answer_source,
             "route": self.route.as_dict() if self.route else None,
             "plan": self.plan.as_dict() if self.plan else None,
+            "chain": self.chain,
             "steps": [s.as_dict() for s in self.steps],
             "budget": self.budget.as_dict() if self.budget else None,
             "cost_usd": round(self.cost_usd, 8),
@@ -322,6 +325,7 @@ class Agent:
             # --- 2. plan ----------------------------------------------------
             plan = self.planner.plan(goal, route)
             result.plan = plan
+            result.chain = list(plan.chain)
             result.notes.extend(plan.notes)
             if plan.cost_usd:
                 budget.charge(usd=plan.cost_usd, llm_calls=1)
@@ -334,7 +338,8 @@ class Agent:
             for step in plan.steps:
                 budget.charge(steps=1)
                 budget.check()
-                report = self._execute_step(run_id, step, goal, budget)
+                executable_step = self._materialize_chain_step(step, result.steps)
+                report = self._execute_step(run_id, executable_step, goal, budget)
                 result.steps.append(report)
                 if not report.ok:
                     if report.failure_kind == "policy":
@@ -379,6 +384,37 @@ class Agent:
             return self._finalize(result, run_id=run_id, started=started)
 
     # -------------------------------------------------------------------- steps
+    def _materialize_chain_step(self, step: PlanStep, completed: list[StepReport]) -> PlanStep:
+        """Pass the previous verified result into a composed step when possible.
+
+        Manifests deliberately describe semantic types, not an unsafe executable
+        wiring language. For the common one-input case, map the previous result
+        to the declared field immediately before policy validation; multi-input
+        tools keep any fields that can be copied by name and otherwise fail closed
+        at the normal input-schema check.
+        """
+        if step.chain_input is None or step.chain_input >= len(completed):
+            return step
+        previous = completed[step.chain_input].result or {}
+        manifest = self.registry.get(step.tool, step.version)
+        if not manifest.inputs:
+            return replace(step, inputs={})
+
+        inputs = dict(step.inputs)
+        matching = {name: previous[name] for name in manifest.inputs if name in previous}
+        inputs.update(matching)
+        if len(manifest.inputs) == 1:
+            name, typ = next(iter(manifest.inputs.items()))
+            if name not in inputs:
+                if typ in {"dict", "any"}:
+                    inputs[name] = previous
+                elif typ == "string":
+                    value = previous.get("text", previous.get("summary", previous))
+                    inputs[name] = (
+                        value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+                    )
+        return replace(step, inputs=inputs)
+
     def _execute_step(self, run_id: str, step: PlanStep, goal: str, budget: Budget) -> StepReport:
         manifest = self.registry.get(step.tool, step.version)
         report = StepReport(
@@ -625,6 +661,7 @@ class Agent:
                     llm_calls=result.llm_calls,
                     answer=result.answer,
                     error=next((s.error for s in result.steps if s.error), ""),
+                    chain=list(result.chain),
                 )
             )
         return result
