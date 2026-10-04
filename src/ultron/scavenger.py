@@ -212,9 +212,10 @@ class Scavenger:
         try:
             parsed = urllib.parse.urlparse(url)
             host = (parsed.hostname or "").lower()
+            allowed = parsed.scheme == "https" and host in self.allowed_domains
         except ValueError:
-            host = ""
-        if parsed.scheme not in {"https"} or host not in self.allowed_domains:
+            allowed = False
+        if not allowed:
             self.rejections.append({"url": url, "reason": "domain is outside strict allowlist"})
             LOG.warning("scavenger rejected non-allowlisted URL: %s", url)
             return False
