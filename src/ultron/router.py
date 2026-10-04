@@ -16,13 +16,19 @@ the goal deserves. Tool choice belongs to the planner/registry.
 
 from __future__ import annotations
 
+import os
 import re
+import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .adapters.zero_auth import AdapterResponse, PollinationsAdapter, ZeroAuthUnavailable
 from .cache import Cache, make_key
 from .config import Settings, get_settings
-from .llm import LLMClient
+from .ledger import FailureLedger
+from .llm import LLMClient, extract_json
+from .provenance import ProvenanceEnvelope
 from .registry import Registry
 
 Difficulty = Literal["trivial", "easy", "medium", "hard"]
@@ -94,7 +100,8 @@ class RouteDecision:
     plan_depth: int
     needs_tools: bool
     reason: str
-    source: Literal["cache", "rules", "llm", "fallback"] = "rules"
+    source: Literal["cache", "rules", "llm", "waterfall", "fallback"] = "rules"
+    provider: str = ""
     cached: bool = False
     cost_usd: float = 0.0
     model: str = ""
@@ -116,6 +123,7 @@ class RouteDecision:
             "cached": self.cached,
             "cost_usd": self.cost_usd,
             "model": self.model,
+            "provider": self.provider,
             "suggested_tools": self.suggested_tools,
             "signals": self.signals,
         }
@@ -131,11 +139,26 @@ class Router:
         cache: Cache | None = None,
         llm: LLMClient | None = None,
         settings: Settings | None = None,
+        waterfall: FreeWaterfallRouter | None = None,
+        providers: list[Any] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.registry = registry
         self.cache = cache or Cache(self.settings)
         self.llm = llm or LLMClient(self.cache, self.settings)
+        self.waterfall = waterfall or FreeWaterfallRouter(
+            self.settings, providers=providers, ledger=FailureLedger(self.settings.state_dir)
+        )
+
+    def waterfall_complete(
+        self,
+        messages: Iterable[dict[str, str]],
+        *,
+        goal: str = "",
+        kind: str = "generic",
+    ) -> AdapterResponse | None:
+        """Try enabled free providers; ``None`` is the deterministic fallback."""
+        return self.waterfall.complete(messages, goal=goal, kind=kind)
 
     def route(self, goal: str) -> RouteDecision:
         goal = (goal or "").strip()
@@ -255,7 +278,31 @@ class Router:
 
     # ------------------------------------------------------------------- model
     def _escalate(self, goal: str, fallback: RouteDecision, cache_key: str) -> RouteDecision:
-        """One cheap-model call for ambiguous goals. Failure => rules answer."""
+        """Use the free waterfall before any paid/keyed LLM call."""
+        if self.waterfall.enabled:
+            registry_hint = ", ".join(
+                f"{m.name}({m.description[:40]})" for m in self.registry.latest()[:8]
+            )
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Available tools: {registry_hint or 'none'}\\nGoal: {goal[:1200]}",
+                },
+            ]
+            response = self.waterfall.complete(messages, goal=goal, kind="route")
+            if response is not None:
+                parsed = response.json or extract_json(response.text)
+                if parsed:
+                    decision = self._decision_from_provider(parsed, fallback, response)
+                    if decision is not None:
+                        return decision
+            # A provider outage or malformed result is fail-open to rules. Do
+            # not silently fall through to a paid provider after a free miss.
+            fallback.reason = f"{fallback.reason} (waterfall unavailable: rules answer kept)"
+            fallback.source = "rules"
+            return fallback
+
         if self.llm.offline:
             fallback.reason = f"{fallback.reason} (offline: rules answer kept)"
             fallback.source = "rules"
@@ -318,6 +365,30 @@ class Router:
             signals=fallback.signals,
         )
 
+    @staticmethod
+    def _decision_from_provider(
+        data: dict[str, Any], fallback: RouteDecision, response: AdapterResponse
+    ) -> RouteDecision | None:
+        difficulty = str(data.get("difficulty", "")).lower()
+        if difficulty not in DIFFICULTY_DEPTH:
+            return None
+        try:
+            depth = int(data.get("plan_depth", DIFFICULTY_DEPTH[difficulty]))
+        except (TypeError, ValueError):
+            depth = DIFFICULTY_DEPTH[difficulty]
+        return RouteDecision(
+            difficulty=difficulty,  # type: ignore[arg-type]
+            plan_depth=max(0, min(3, depth)),
+            needs_tools=bool(data.get("needs_tools", True)),
+            reason=str(data.get("reason", "waterfall classification"))[:200],
+            source="waterfall",
+            cost_usd=0.0,
+            model=response.model,
+            provider=response.provider,
+            suggested_tools=fallback.suggested_tools,
+            signals=fallback.signals,
+        )
+
     # ------------------------------------------------------------------ caching
     def _store(self, cache_key: str, decision: RouteDecision) -> None:
         payload = decision.as_dict()
@@ -325,3 +396,158 @@ class Router:
             payload.pop(volatile, None)
         payload["reason"] = payload["reason"].split(" (")[0]
         self.cache.set("router", cache_key, payload, ttl_s=self.settings.cache_ttl_llm)
+
+
+@dataclass(slots=True)
+class ProviderFailure:
+    provider: str
+    reason: str
+    status: int | None = None
+
+
+class KeyPoolAdapter:
+    """Small keyed-provider adapter backed by LiteLLM's provider routing."""
+
+    def __init__(self, provider: str, env_name: str, model: str) -> None:
+        self.provider = provider
+        self.env_name = env_name
+        self.model = model
+
+    def complete(
+        self, messages: Iterable[dict[str, str]], *, timeout: float = 15.0, **_: Any
+    ) -> AdapterResponse:
+        if not os.environ.get(self.env_name):
+            raise ZeroAuthUnavailable(f"{self.env_name} is not configured")
+        try:
+            import litellm
+
+            completion = litellm.completion(
+                model=self.model,
+                messages=[dict(message) for message in messages],
+                temperature=0.0,
+                max_tokens=512,
+                timeout=timeout,
+            )
+            text = (completion.choices[0].message.content or "").strip()
+            if not text:
+                raise ZeroAuthUnavailable(f"{self.provider} returned an empty completion")
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            raise ZeroAuthUnavailable(
+                f"{self.provider} unavailable: {type(exc).__name__}", status=status
+            ) from exc
+        response = AdapterResponse(text=text, provider=self.provider, model=self.model)
+        response.provenance = [
+            ProvenanceEnvelope.create(
+                "llm_generated",
+                f"llm:{self.provider}:{uuid.uuid4().hex[:16]}",
+                text,
+                metadata={"provider": self.provider, "model": self.model},
+            )
+        ]
+        response.verify_with_breaker()
+        return response
+
+
+class FreeWaterfallRouter:
+    """Tiered provider cascade with a deterministic, no-network default."""
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        providers: list[Any] | None = None,
+        ledger: FailureLedger | None = None,
+        timeout: float = 15.0,
+    ) -> None:
+        self.settings = settings or get_settings()
+        self.timeout = timeout
+        self.ledger = ledger
+        self._injected = providers
+        self.failures: list[ProviderFailure] = []
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._injected is not None or self.providers())
+
+    def providers(self) -> list[Any]:
+        if self._injected is not None:
+            return list(self._injected)
+        providers: list[Any] = []
+        if self.settings.allow_zero_auth or os.environ.get("ULTRON_ALLOW_ZERO_AUTH") == "1":
+            providers.append(
+                PollinationsAdapter(
+                    timeout=self.timeout,
+                    model=os.environ.get("ULTRON_ZERO_AUTH_MODEL", "llama"),
+                )
+            )
+        keyed = (
+            (
+                "openrouter",
+                "OPENROUTER_API_KEY",
+                os.environ.get("ULTRON_OPENROUTER_MODEL", "openrouter/free"),
+            ),
+            (
+                "sambanova",
+                "SAMBANOVA_API_KEY",
+                os.environ.get("ULTRON_SAMBANOVA_MODEL", "sambanova/Meta-Llama-3.1-8B-Instruct"),
+            ),
+            (
+                "groq",
+                "GROQ_API_KEY",
+                os.environ.get("ULTRON_GROQ_MODEL", "groq/llama-3.1-8b-instant"),
+            ),
+            (
+                "cerebras",
+                "CEREBRAS_API_KEY",
+                os.environ.get("ULTRON_CEREBRAS_MODEL", "cerebras/llama3.1-8b"),
+            ),
+            (
+                "gemini",
+                "GEMINI_API_KEY",
+                os.environ.get("ULTRON_GEMINI_MODEL", "gemini/gemini-2.0-flash"),
+            ),
+        )
+        providers.extend(KeyPoolAdapter(*entry) for entry in keyed if os.environ.get(entry[1]))
+        return providers
+
+    def complete(
+        self,
+        messages: Iterable[dict[str, str]],
+        *,
+        goal: str = "",
+        kind: str = "generic",
+    ) -> AdapterResponse | None:
+        self.failures = []
+        providers = self.providers()
+        if not providers:
+            if self.ledger is not None and goal:
+                self.ledger.record_gap(
+                    goal,
+                    expected_outputs={"answer": "string"},
+                    failure_reason="no zero-auth or free-key providers configured",
+                )
+            return None
+        message_list = [dict(message) for message in messages]
+        for provider in providers:
+            name = getattr(provider, "provider", type(provider).__name__)
+            try:
+                try:
+                    response = provider.complete(message_list, timeout=self.timeout, kind=kind)
+                except TypeError:
+                    response = provider.complete(message_list)
+                if response is not None:
+                    return response
+            except Exception as exc:
+                status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+                self.failures.append(ProviderFailure(name, str(exc), status))
+                continue
+        if self.ledger is not None and goal:
+            self.ledger.record_gap(
+                goal,
+                expected_outputs={"answer": "string"},
+                failure_reason="; ".join(
+                    f"{item.provider}: {item.reason}" for item in self.failures
+                ),
+            )
+        return None

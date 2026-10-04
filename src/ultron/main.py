@@ -31,6 +31,7 @@ from .memory import Memory
 from .policy import DenyAllPrompter, PolicyGate, default_prompter
 from .registry import Registry
 from .sandbox import Sandbox
+from .scavenger import Scavenger
 
 
 def _console():
@@ -361,6 +362,53 @@ def cmd_forge(args: argparse.Namespace) -> int:
     return 0 if not report["failed"] else 1
 
 
+def cmd_scavenge(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    scavenger = Scavenger(settings, max_candidates=args.max)
+    candidates = scavenger.discover()
+    forged = (
+        scavenger.forge_candidates(candidates, max_tools=args.max)
+        if candidates
+        else {"forged": [], "failed": [], "skipped": []}
+    )
+    report = {
+        "candidates": [
+            {
+                "name": item.name,
+                "url": item.spec_url,
+                "spec_hash": item.spec_hash,
+                "method": item.method,
+                "endpoint": item.endpoint,
+            }
+            for item in candidates
+        ],
+        "forged": [getattr(item, "name", item) for item in forged["forged"]],
+        "failed": forged["failed"],
+        "skipped": forged["skipped"],
+        "rejections": scavenger.rejections,
+        "fetch_errors": scavenger.fetch_errors,
+    }
+    if args.json:
+        _print_json(report)
+        return 0
+    from rich.table import Table
+
+    if not candidates:
+        _console().print("No scavenger candidates found (disabled or empty allowlisted sources).")
+    else:
+        table = Table(title="OpenAPI scavenger candidates", header_style="bold")
+        for column in ("name", "method", "endpoint", "spec hash"):
+            table.add_column(column)
+        for item in candidates:
+            table.add_row(item.name, item.method.upper(), item.endpoint, item.spec_hash[:12])
+        _console().print(table)
+        _console().print(
+            f"Forged: {len(report['forged'])}; failed: {len(report['failed'])}; "
+            f"rejected: {len(report['rejections'])}"
+        )
+    return 0 if not report["failed"] else 1
+
+
 def _load_eval_module():
     """Import ``eval/run.py`` by path (it deliberately is not a package)."""
     import importlib.util
@@ -458,6 +506,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_forge = add_sub("forge", help="process explicit-code capability forge templates")
     p_forge.add_argument("--limit", type=int, default=3, help="maximum gaps to process")
     p_forge.set_defaults(func=cmd_forge)
+
+    p_scavenge = add_sub("scavenge", help="discover and safely wrap allowlisted OpenAPI specs")
+    p_scavenge.add_argument("--max", type=int, default=20, dest="max", help="maximum candidates")
+    p_scavenge.set_defaults(func=cmd_scavenge)
 
     p_doc = add_sub("doctor", help="check the environment")
     p_doc.set_defaults(func=cmd_doctor)

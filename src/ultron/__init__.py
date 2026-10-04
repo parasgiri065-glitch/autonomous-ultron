@@ -38,6 +38,7 @@ __all__ = [
     "Registry",
     "Router",
     "Sandbox",
+    "Scavenger",
     "Verifier",
     "__version__",
 ]
@@ -56,6 +57,7 @@ _LAZY = {
     "ProvenanceEnvelope": ("ultron.provenance", "ProvenanceEnvelope"),
     "Registry": ("ultron.registry", "Registry"),
     "Router": ("ultron.router", "Router"),
+    "Scavenger": ("ultron.scavenger", "Scavenger"),
     "Sandbox": ("ultron.sandbox", "Sandbox"),
     "Verifier": ("ultron.verifier", "Verifier"),
 }

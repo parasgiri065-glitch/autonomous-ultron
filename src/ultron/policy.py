@@ -508,8 +508,17 @@ class PolicyGate:
 
         wants_network = manifest.wants_network
         network_ok = self._network_allowed(request, wants_network)
+        # A scavenged wrapper can be tested against its explicit mock response
+        # while retaining its network declaration for real execution. The
+        # decision remains network=none; this narrow exception never applies to
+        # ordinary tool execution or to a forge test without a mock input.
+        offline_forge_mock = (
+            request.action_type == "forge_test"
+            and request.allow_network is False
+            and "mock_response" in request.inputs
+        )
         network = manifest.network_detail if (wants_network and network_ok) else "none"
-        if wants_network and not network_ok:
+        if wants_network and not network_ok and not offline_forge_mock:
             return self._deny(
                 request, "tool requests network egress but policy denies it", network="none", **base
             )
