@@ -39,6 +39,9 @@ __all__ = [
     "Router",
     "Sandbox",
     "Scavenger",
+    "TelegramBotClient",
+    "TelegramCockpit",
+    "TelegramPrompter",
     "Verifier",
     "__version__",
 ]
@@ -59,6 +62,9 @@ _LAZY = {
     "Router": ("ultron.router", "Router"),
     "Scavenger": ("ultron.scavenger", "Scavenger"),
     "Sandbox": ("ultron.sandbox", "Sandbox"),
+    "TelegramBotClient": ("ultron.interfaces.telegram", "TelegramBotClient"),
+    "TelegramCockpit": ("ultron.interfaces.telegram", "TelegramCockpit"),
+    "TelegramPrompter": ("ultron.interfaces.telegram", "TelegramPrompter"),
     "Verifier": ("ultron.verifier", "Verifier"),
 }
 
