@@ -19,6 +19,8 @@ env:
   ULTRON_ALLOW_LOCAL_SANDBOX: "1"
   ULTRON_ENABLE_LLM_JUDGE: "0"
   ULTRON_ENABLE_SYNTHESIS: "0"
+  ULTRON_ALLOW_ZERO_AUTH: "0"
+  ULTRON_SCAVENGE: "0"
   # Price the stub calls with the real model table so the cost gate cannot pass
   # vacuously. Reports are labelled cost_basis="simulated".
   ULTRON_COST_SIMULATE: "1"

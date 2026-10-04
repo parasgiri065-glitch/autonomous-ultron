@@ -1,0 +1,101 @@
+name: Nightly compounding
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: compounding
+  cancel-in-progress: true
+
+env:
+  ULTRON_LLM_MODE: offline
+  ULTRON_SANDBOX: local
+  ULTRON_ALLOW_LOCAL_SANDBOX: "1"
+  ULTRON_ENABLE_LLM_JUDGE: "0"
+  ULTRON_ENABLE_SYNTHESIS: "0"
+  ULTRON_SCAVENGE: "0"
+  ALLOW_SCAVENGE: ${{ vars.ALLOW_SCAVENGE || 'false' }}
+
+jobs:
+  compound:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv and dependencies
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+
+      - name: Inspect capability gaps
+        id: gaps
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run ultron gaps --json > /tmp/gaps.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          gaps = json.loads(Path('/tmp/gaps.json').read_text())
+          print(f"found {len(gaps)} capability gap(s)")
+          if not gaps:
+              print('has_gaps=false')
+          else:
+              print('has_gaps=true')
+          PY
+          has_gaps=$(python - <<'PY'
+          import json
+          from pathlib import Path
+          print('true' if json.loads(Path('/tmp/gaps.json').read_text()) else 'false')
+          PY
+          )
+          echo "has_gaps=$has_gaps" >> "$GITHUB_OUTPUT"
+          if [ "$has_gaps" = false ]; then
+            echo "No gaps; nightly run is complete."
+          fi
+
+      - name: Scavenge and forge explicitly enabled candidates
+        if: ${{ steps.gaps.outputs.has_gaps == 'true' && env.ALLOW_SCAVENGE == 'true' }}
+        env:
+          ULTRON_SCAVENGE: "1"
+        run: uv run ultron scavenge --max 3 --json
+
+      - name: Run deterministic tests
+        if: ${{ steps.gaps.outputs.has_gaps == 'true' }}
+        run: uv run pytest -q
+
+      - name: Run evaluation gate
+        if: ${{ steps.gaps.outputs.has_gaps == 'true' }}
+        run: uv run python eval/run.py --passes 3
+
+      - name: Open a proposal for newly forged tools
+        if: ${{ steps.gaps.outputs.has_gaps == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- tools/dynamic)" ]; then
+            echo "No newly forged tools."
+            exit 0
+          fi
+          date_utc=$(date -u +%F)
+          branch="auto/compounding-${date_utc}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add tools/dynamic
+          git commit -m "chore: nightly compounding ${date_utc}"
+          git push --set-upstream origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Ultron Self-Improvement: ${date_utc}" \
+            --body "Nightly deterministic tests and evaluation passed; please review the forged tools."
