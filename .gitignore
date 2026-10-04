@@ -22,6 +22,11 @@ htmlcov/
 eval/last_report.json
 eval/last_report.md
 
+# generated review artifacts (scripts/collect_review.py) — never committed
+review_bundle.md
+phase1.bundle
+phase1.tar.gz
+
 # os
 .DS_Store
 
