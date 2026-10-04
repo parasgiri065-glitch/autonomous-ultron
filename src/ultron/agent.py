@@ -403,7 +403,9 @@ class Agent:
         try:
             decision: PolicyDecision = self.gate.evaluate(request, interactive=self.interactive)
         except (PolicyDenied, HumanApprovalRequired) as exc:
-            decision = self.gate.check(request)
+            # peek, not check: this path only reports what the gate decided. It must
+            # not claim a stored approval as a side effect of logging.
+            decision = self.gate.peek(request)
             report.policy_action = decision.action
             report.policy_reason = decision.reason
             report.error = str(exc)

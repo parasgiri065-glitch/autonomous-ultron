@@ -19,7 +19,13 @@ Fail-closed behaviours implemented here:
   * ``secrets:*`` permission        -> deny in Phase 1 unconditionally
   * ``fs:write:*`` (host writes)    -> deny in Phase 1 (mount is read-only)
   * network requested but policy is 'deny' -> deny
+  * LOW risk **and** network requested -> escalated to MEDIUM (ask) unless
+    ``ULTRON_POLICY_NETWORK_LOW_AUTO=1``. Phase 3 auto-discovers manifests, and
+    "LOW + network runs unattended" is a landmine.
   * non-interactive terminal + MEDIUM/HIGH -> deny (never silently assume yes)
+  * a stored approval is *claimed* (consumed) as part of the decision in
+    :meth:`PolicyGate.check`, so a decision can never be replayed by a caller
+    that runs it without going through :meth:`PolicyGate.evaluate`
 
 Every decision is appended to a JSONL audit log with the *digest* of the inputs,
 not the raw inputs, so the log itself is not a data-leak vector.
@@ -27,11 +33,13 @@ not the raw inputs, so the log itself is not a data-leak vector.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -39,7 +47,7 @@ from typing import Any, Literal, Protocol
 from .cache import canonical_json, make_key
 from .config import Settings, get_settings
 from .errors import HumanApprovalRequired, PolicyDenied
-from .registry import PHASE1_DENIED_SCOPES, TYPE_MAP, ToolManifest
+from .registry import PHASE1_DENIED_SCOPES, TYPE_MAP, RiskTier, ToolManifest
 
 Decision = Literal["allow", "ask", "deny"]
 ApprovalVerdict = Literal["granted", "denied", "no_human", "not_required"]
@@ -51,6 +59,12 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}")),
     ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{16,}")),
     ("github_token", re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{20,})")),
+    # Fine-grained PATs (`github_pat_...`) do not match the classic `gh[pousr]_`
+    # shape, so the token most likely to be pasted into a prompt slipped through.
+    ("github_pat_fg", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
+    ("gitlab_token", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}")),
+    ("hf_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}")),
+    ("stripe_live", re.compile(r"\b(sk|rk)_live_[A-Za-z0-9]{20,}")),
     ("aws_access_key", re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}")),
     ("slack_token", re.compile(r"\bxox[abprs]-[0-9A-Za-z\-]{10,}")),
@@ -201,6 +215,10 @@ class PolicyDecision:
     approval_id: str | None = None
     limits: dict[str, Any] = field(default_factory=dict)
     secrets_found: list[str] = field(default_factory=list)
+    #: Risk the manifest declares, before any escalation (see ``escalated``).
+    declared_risk: str = ""
+    #: True when a LOW-risk tool that asks for network was escalated to MEDIUM.
+    escalated: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -211,6 +229,8 @@ class PolicyDecision:
             "action": self.action,
             "reason": self.reason,
             "risk": self.risk,
+            "declared_risk": self.declared_risk,
+            "escalated": self.escalated,
             "tool": self.tool,
             "version": self.version,
             "network": self.network,
@@ -310,11 +330,12 @@ class ApprovalStore:
         self._write(data)
         return approval
 
-    def find(self, request: PolicyRequest) -> dict[str, Any] | None:
-        """Return a valid, unused, unexpired approval pinned to this exact action."""
+    @staticmethod
+    def _select(data: dict[str, Any], request: PolicyRequest) -> dict[str, Any] | None:
+        """Pick the approval that authorises this exact action, if any."""
         now = time.time()
         digest = input_digest(request.inputs)
-        for approval in self._read().get("approvals", []):
+        for approval in data.get("approvals", []):
             if approval.get("tool") != request.tool.name:
                 continue
             if approval.get("content_hash") != request.tool.content_hash:
@@ -327,6 +348,59 @@ class ApprovalStore:
                 continue
             return approval
         return None
+
+    def find(self, request: PolicyRequest) -> dict[str, Any] | None:
+        """Return a valid approval pinned to this exact action, *without* spending it.
+
+        Read-only, for inspection paths (UI, :meth:`PolicyGate.peek`). Anything
+        that grants access must use :meth:`claim` instead.
+        """
+        return self._select(self._read(), request)
+
+    def claim(self, request: PolicyRequest) -> dict[str, Any] | None:
+        """Atomically find **and** spend a valid approval for this exact action.
+
+        This is the only way the gate grants access from a stored approval.
+        Previously the gate did ``find()`` and then ``consume()`` as two separate
+        read-modify-write passes, so a caller that used ``check()`` directly
+        (instead of ``evaluate()``) could replay one approval for its whole TTL:
+        the decision stayed valid, and every later run re-found the same grant.
+
+        Doing it in one locked read-modify-write closes the replay window and also
+        makes it safe for two concurrent agent processes to share an approval
+        store — only one of them can claim a given grant.
+        """
+        with self._locked():
+            data = self._read()
+            approval = self._select(data, request)
+            if approval is None:
+                return None
+            approval["uses"] = approval.get("uses", 0) + 1
+            approval["last_used_at"] = time.time()
+            self._write(data)
+            return approval
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Exclusive cross-process lock around an approval read-modify-write.
+
+        ``fcntl.flock`` on a sidecar lock file (POSIX). On platforms without
+        fcntl the lock degrades to a no-op, so atomicity would then be
+        per-process only — acceptable for a single-operator Phase 1 harness,
+        and documented rather than silently assumed.
+        """
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX dev machines
+            yield
+            return
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def consume(self, approval_id: str) -> None:
         data = self._read()
@@ -363,8 +437,18 @@ class PolicyGate:
         self.audit = audit or AuditLog(self.settings.audit_log, run_id=run_id)
 
     # ------------------------------------------------------------ entry points
-    def check(self, request: PolicyRequest) -> PolicyDecision:
-        """Static, non-interactive decision. Never prompts a human."""
+    def check(self, request: PolicyRequest, *, consume: bool = True) -> PolicyDecision:
+        """Decide, and by default *spend* any stored approval the decision relies on.
+
+        Never prompts a human. It is deliberately not a pure read: when a stored
+        approval authorises the action, that approval is **claimed** (one locked
+        read-modify-write) as part of producing the decision. A caller that runs
+        the returned decision directly — bypassing :meth:`evaluate` — therefore
+        cannot replay it; the next ``check()`` for the same action has no grant
+        left and returns ``ask`` (MEDIUM) or ``deny`` (HIGH).
+
+        Use ``consume=False`` or :meth:`peek` for pure inspection (reporting, UI).
+        """
         manifest = request.tool
         limits = {
             "timeout_s": min(
@@ -426,18 +510,33 @@ class PolicyGate:
                 request, "tool requests network egress but policy denies it", network="none", **base
             )
 
-        # 3. Risk tier -----------------------------------------------------
-        risk = manifest.risk
-        if risk.value == "low":
-            approval = self.store.find(request)
-            if approval is not None:  # unusual but harmless: leftover low-risk grant
-                self.store.consume(approval["id"])
+        # 3. Effective risk tier -------------------------------------------
+        # A LOW-risk tool that asks for network access is escalated to MEDIUM by
+        # default. Phase 3 auto-discovers manifests, and "declared LOW" is not a
+        # property we can trust from a discovered tool: LOW + egress running
+        # unattended is a landmine, so a human looks at it unless the operator
+        # has explicitly opted in with ULTRON_POLICY_NETWORK_LOW_AUTO=1.
+        declared_risk = manifest.risk
+        escalated = (
+            declared_risk is RiskTier.LOW
+            and wants_network
+            and not self.settings.policy_network_low_auto
+        )
+        risk = RiskTier.MEDIUM if escalated else declared_risk
+        base.update(risk=risk.value, declared_risk=declared_risk.value, escalated=escalated)
+
+        if risk is RiskTier.LOW:
+            if consume:
+                # Burn any leftover grant for this exact action so it cannot be
+                # replayed later (it does not affect the decision: LOW auto-runs).
+                self.store.claim(request)
             return self._allow(
                 request, "low risk: auto-approved (sandboxed)", network=network, **base
             )
 
-        approval = self.store.find(request)
-        if risk.value == "high":
+        # MEDIUM / HIGH: a stored approval is *claimed* here, not merely found.
+        approval = self.store.claim(request) if consume else self.store.find(request)
+        if risk is RiskTier.HIGH:
             if approval is None:
                 return self._deny(
                     request,
@@ -465,7 +564,17 @@ class PolicyGate:
                 approval_id=approval["id"],
                 **base,
             )
-        return self._ask(request, "medium risk: human approval required", network=network, **base)
+        reason = "medium risk: human approval required"
+        if escalated:
+            reason = (
+                "low risk tool requests network access: escalated to human approval "
+                "(set ULTRON_POLICY_NETWORK_LOW_AUTO=1 to auto-run it)"
+            )
+        return self._ask(request, reason, network=network, **base)
+
+    def peek(self, request: PolicyRequest) -> PolicyDecision:
+        """Non-consuming preview of a decision (reporting/UI paths)."""
+        return self.check(request, consume=False)
 
     def evaluate(self, request: PolicyRequest, *, interactive: bool = True) -> PolicyDecision:
         """``check`` then, if needed and allowed, ask the human. Raises on deny."""
@@ -473,8 +582,8 @@ class PolicyGate:
         if decision.action == "deny":
             raise PolicyDenied(decision.reason, tool=request.tool.name, risk=decision.risk)
         if decision.action == "allow":
-            if decision.approval_id:
-                self.store.consume(decision.approval_id)
+            # check() already claimed (consumed) any stored approval it relied on;
+            # consuming again here would burn a second use of the same grant.
             return decision
 
         # action == "ask"
@@ -603,6 +712,8 @@ class PolicyGate:
             risk=decision.risk,
             reason=decision.reason,
             network=decision.network,
+            declared_risk=decision.declared_risk or decision.risk,
+            escalated=decision.escalated or None,
             inputs_digest=input_digest(request.inputs),
             input_fields=sorted(request.inputs),
             goal_digest=goal_digest(request.goal),

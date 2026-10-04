@@ -24,7 +24,13 @@ import pytest
 from ultron.agent import Agent, Budget
 from ultron.cache import Cache, make_key
 from ultron.config import REPO_ROOT, load_settings
-from ultron.errors import BudgetExceeded, HumanApprovalRequired, PolicyDenied, SandboxUnavailable
+from ultron.errors import (
+    BudgetExceeded,
+    HumanApprovalRequired,
+    PolicyDenied,
+    SandboxError,
+    SandboxUnavailable,
+)
 from ultron.memory import Memory
 from ultron.planner import Planner
 from ultron.policy import (
@@ -63,6 +69,10 @@ def settings(tmp_path: Path):
         enable_llm_judge=False,
         budget_max_usd=1.0,
         policy_network="auto",
+        # Explicit, not ambient: the dev posture for these tests is "the operator
+        # accepted LOW+network auto-run". The fail-closed default is asserted
+        # separately in the escalation tests below.
+        policy_network_low_auto=True,
         # Tools read the fixture corpus instead of the network; only allowlisted,
         # non-secret names cross into the sandbox.
         env_allowlist=["ULTRON_WEB_MOCK"],
@@ -361,6 +371,9 @@ def gate_settings_offline():
         sandbox_backend="local",
         allow_local_sandbox=True,
         llm_mode="offline",
+        # Pinned so a developer's ambient .env can never change what these
+        # tests assert (the production default is False).
+        policy_network_low_auto=False,
     )
 
 
@@ -469,6 +482,152 @@ def test_network_can_be_disabled_globally(tmp_path, registry):
     assert decision.action == "deny" and "network egress" in decision.reason
 
 
+# ------------------------------------------- approval replay is closed (FIX 1)
+def _medium_calc(registry):
+    """A MEDIUM-risk copy of calc: same code, so the sandbox still runs it."""
+    return registry.get("calc").model_copy(update={"risk": RiskTier.MEDIUM})
+
+
+def test_check_consumes_a_stored_approval_so_it_cannot_be_replayed(settings, registry):
+    """Regression: check() returned allow + approval_id *without* consuming it.
+
+    A caller that runs the decision straight from check() (bypassing evaluate())
+    could therefore replay one stored approval for its whole TTL.
+    """
+    store = ApprovalStore(settings.approvals_file)
+    gate = PolicyGate(settings, prompter=ScriptedPrompter(default=None), store=store)
+    sandbox = Sandbox(settings, backend="local")
+    manifest = _medium_calc(registry)
+    inputs = {"expression": "6*7"}
+    request = PolicyRequest(tool=manifest, inputs=inputs, goal="replay")
+
+    store.grant(request, approver="operator", max_uses=1)
+
+    first = gate.check(request)
+    assert first.allowed and first.approval_id, "the stored approval must authorise run 1"
+    assert sandbox.run(manifest, inputs, first).ok
+
+    second = gate.check(request)
+    assert second.action in {"ask", "deny"}, "the approval was replayed"
+    assert not second.allowed
+    with pytest.raises((PolicyDenied, HumanApprovalRequired)):
+        gate.evaluate(request, interactive=False)
+    # defence in depth: the sandbox refuses a non-allowed decision outright
+    with pytest.raises(SandboxError):
+        sandbox.run(manifest, inputs, second)
+
+
+def test_high_risk_approval_is_spent_by_check(settings, registry):
+    store = ApprovalStore(settings.approvals_file)
+    gate = PolicyGate(settings, store=store)
+    manifest = registry.get("calc").model_copy(update={"risk": RiskTier.HIGH})
+    request = PolicyRequest(tool=manifest, inputs={"expression": "1+1"})
+
+    assert gate.check(request).action == "deny"  # no pinned approval yet
+    store.grant(request, approver="operator", max_uses=1)
+    assert gate.check(request).allowed
+    assert gate.check(request).action == "deny"  # spent; HIGH never falls back to ask
+
+
+def test_evaluate_does_not_double_consume_a_grant(settings, registry):
+    store = ApprovalStore(settings.approvals_file)
+    gate = PolicyGate(settings, prompter=ScriptedPrompter([True]), store=store)
+    manifest = _medium_calc(registry)
+    request = PolicyRequest(tool=manifest, inputs={"expression": "2+2"})
+
+    assert gate.evaluate(request, interactive=True).allowed
+    stored = json.loads(Path(settings.approvals_file).read_text())["approvals"]
+    assert stored and all(a["uses"] <= a["max_uses"] for a in stored), stored
+    assert gate.check(request).action == "ask"  # single use, already spent
+
+
+def test_peek_does_not_consume(settings, registry):
+    store = ApprovalStore(settings.approvals_file)
+    gate = PolicyGate(settings, store=store)
+    manifest = _medium_calc(registry)
+    request = PolicyRequest(tool=manifest, inputs={"expression": "3+3"})
+    store.grant(request, approver="operator", max_uses=1)
+
+    assert gate.peek(request).allowed  # preview shows it *would* be allowed
+    assert gate.check(request).allowed  # ...and the grant survived the peek
+    assert not gate.check(request).allowed  # ...but it is spent after the claim
+
+
+def test_claim_is_single_winner_and_locked(settings, registry):
+    store = ApprovalStore(settings.approvals_file)
+    request = PolicyRequest(tool=_medium_calc(registry), inputs={"expression": "1*1"})
+    store.grant(request, approver="operator", max_uses=1)
+    assert store.claim(request) is not None
+    assert store.claim(request) is None
+    assert Path(str(settings.approvals_file) + ".lock").exists()  # lock sidecar used
+
+
+# --------------------------------- LOW + network escalation, both branches (FIX 3)
+def test_low_risk_network_is_escalated_to_ask_by_default(settings, registry):
+    """The default posture: LOW risk + network request -> a human is asked."""
+    strict = settings.model_copy(update={"policy_network_low_auto": False})
+    gate = PolicyGate(strict, prompter=ScriptedPrompter(default=None))
+    manifest = registry.get("web_research")
+    assert manifest.risk is RiskTier.LOW and manifest.wants_network  # precondition
+    request = PolicyRequest(tool=manifest, inputs={"query": "fluoridation", "max_sources": 1})
+
+    decision = gate.check(request)
+    assert decision.action == "ask", decision.reason
+    assert decision.escalated is True
+    assert decision.risk == "medium"  # effective
+    assert decision.declared_risk == "low"  # as written in the manifest
+    assert "escalated" in decision.reason
+    assert decision.network == "http"  # the human sees what would be granted
+    with pytest.raises(HumanApprovalRequired):
+        gate.evaluate(request, interactive=False)
+
+
+def test_low_risk_network_auto_runs_when_flag_enabled(settings, registry):
+    """The opt-in branch: ULTRON_POLICY_NETWORK_LOW_AUTO=1 restores auto-run."""
+    permissive = settings.model_copy(update={"policy_network_low_auto": True})
+    gate = PolicyGate(permissive)
+    decision = gate.check(
+        PolicyRequest(
+            tool=registry.get("web_research"), inputs={"query": "fluoridation", "max_sources": 1}
+        )
+    )
+    assert decision.action == "allow" and decision.allowed
+    assert decision.network == "http"
+    assert decision.escalated is False and decision.risk == "low"
+
+
+def test_escalation_does_not_affect_low_risk_tools_without_network(settings, registry):
+    strict = settings.model_copy(update={"policy_network_low_auto": False})
+    gate = PolicyGate(strict)
+    decision = gate.check(PolicyRequest(tool=registry.get("calc"), inputs={"expression": "1+1"}))
+    assert decision.allowed and decision.network == "none" and decision.escalated is False
+
+
+def test_escalated_low_network_still_honours_a_pinned_approval(settings, registry):
+    """Escalation routes through the MEDIUM path, so approvals still work."""
+    strict = settings.model_copy(update={"policy_network_low_auto": False})
+    store = ApprovalStore(strict.approvals_file)
+    gate = PolicyGate(strict, prompter=ScriptedPrompter([True]), store=store)
+    manifest = registry.get("web_research")
+    request = PolicyRequest(tool=manifest, inputs={"query": "fluoridation", "max_sources": 1})
+
+    decision = gate.evaluate(request, interactive=True)
+    assert decision.allowed and decision.escalated is True
+    assert gate.check(request).action == "ask"  # single use: no replay
+
+
+def test_policy_network_deny_beats_escalation(settings, registry):
+    denied = settings.model_copy(
+        update={"policy_network": "deny", "policy_network_low_auto": False}
+    )
+    decision = PolicyGate(denied).check(
+        PolicyRequest(
+            tool=registry.get("web_research"), inputs={"query": "fluoridation", "max_sources": 1}
+        )
+    )
+    assert decision.action == "deny" and "network egress" in decision.reason
+
+
 def test_approval_store_pins_content_hash(tmp_path, registry):
     store = ApprovalStore(tmp_path / "approvals.json")
     manifest = registry.get("http_fetch")
@@ -479,6 +638,49 @@ def test_approval_store_pins_content_hash(tmp_path, registry):
         update={"entrypoint": "python -m tools.http_fetch "}
     )  # different bytes
     assert store.find(PolicyRequest(tool=mutated, inputs=request.inputs)) is None
+
+
+# ------------------------------------------- secret scanner coverage (FIX 2)
+# Assembled at runtime from fragments on purpose: a realistic token-shaped
+# literal in a committed file would (correctly) trip GitHub push protection.
+FAKE_FINE_GRAINED_PAT = "github" + "_pat_" + ("A1b2C3d4E5" * 5)
+FAKE_GITLAB_TOKEN = "gl" + "pat-" + ("Z9y8X7w6V5" * 4)
+FAKE_HF_TOKEN = "hf" + "_" + ("Q1w2E3r4T5" * 4)
+FAKE_STRIPE_LIVE = "sk" + "_live_" + ("R7t8Y9u0I1" * 4)
+
+
+@pytest.mark.parametrize(
+    "token,label",
+    [
+        (FAKE_FINE_GRAINED_PAT, "github_pat_fg"),
+        (FAKE_GITLAB_TOKEN, "gitlab_token"),
+        (FAKE_HF_TOKEN, "hf_token"),
+        (FAKE_STRIPE_LIVE, "stripe_live"),
+    ],
+)
+def test_secret_scanner_covers_provider_tokens(token, label):
+    hits = scan_for_secrets({"field": token})
+    assert any(hit.endswith(label) for hit in hits), (token[:14], hits)
+
+
+def test_fine_grained_pat_in_inputs_is_denied(settings, registry):
+    gate = PolicyGate(settings)
+    request = PolicyRequest(tool=registry.get("calc"), inputs={"expression": FAKE_FINE_GRAINED_PAT})
+
+    decision = gate.check(request)
+    assert decision.action == "deny" and "secrets" in decision.reason
+    assert decision.secrets_found == ["expression:github_pat_fg"]
+    with pytest.raises(PolicyDenied):
+        gate.evaluate(request, interactive=False)
+
+
+def test_secret_redaction_covers_new_patterns():
+    from ultron.policy import _redact
+
+    preview = _redact({"token": FAKE_FINE_GRAINED_PAT, "url": "https://example.test"})
+    assert FAKE_FINE_GRAINED_PAT not in preview["token"]
+    assert "REDACTED" in preview["token"]
+    assert preview["url"] == "https://example.test"  # ordinary values untouched
 
 
 def test_audit_log_records_decisions_without_raw_inputs(settings, registry):

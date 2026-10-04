@@ -151,12 +151,16 @@ jobs:
           # network-mode assertions below, not by reaching a third party.
           ULTRON_WEB_MOCK: /workspace/eval/fixtures/web_mock.json
           ULTRON_ENV_ALLOWLIST: ULTRON_WEB_MOCK
+          # This job has no human to ask, and LOW+network is now escalated to a
+          # human by default. Opt in explicitly so the docker egress path stays
+          # exercised -- and assert below that the *default* still escalates.
+          ULTRON_POLICY_NETWORK_LOW_AUTO: "1"
         run: |
           uv run python - <<'PY'
           import json
           from ultron.config import load_settings
           from ultron.policy import PolicyGate, PolicyRequest
-          from ultron.registry import Registry
+          from ultron.registry import Registry, RiskTier
           from ultron.sandbox import Sandbox
 
           settings = load_settings()
@@ -181,6 +185,39 @@ jobs:
               assert result.docker_network == expected_mode, result.docker_network
               print(f"{name} -> net={result.network}/docker:{result.docker_network} "
                     f"{json.dumps(result.result)[:140]}")
+
+          # default posture: a LOW-risk tool that wants network is escalated to a
+          # human, and an unattended run must refuse rather than self-approve
+          from ultron.errors import HumanApprovalRequired
+          from ultron.policy import DenyAllPrompter
+
+          strict = load_settings(policy_network_low_auto=False)
+          strict_gate = PolicyGate(strict, prompter=DenyAllPrompter())
+          escalated = strict_gate.check(PolicyRequest(
+              tool=registry.get("web_research"), inputs={"query": "x", "max_sources": 1}))
+          assert escalated.action == "ask" and escalated.escalated, escalated.reason
+          try:
+              strict_gate.evaluate(PolicyRequest(
+                  tool=registry.get("web_research"), inputs={"query": "x", "max_sources": 1}),
+                  interactive=False)
+              raise AssertionError("unattended LOW+network run must not be allowed")
+          except HumanApprovalRequired:
+              pass
+          print("default posture verified: low risk + network -> ask (escalated), never auto-run")
+
+          # approval replay: one stored approval authorises exactly one run
+          from ultron.policy import ApprovalStore
+
+          temp = load_settings(state_dir="/tmp/ultron-ci-pol", approvals_file="/tmp/ultron-ci-pol/a.json",
+                               cache_path="/tmp/ultron-ci-pol/c.db", memory_path="/tmp/ultron-ci-pol/m.db",
+                               audit_log="/tmp/ultron-ci-pol/x.jsonl")
+          store = ApprovalStore(temp.approvals_file)
+          calc_medi = registry.get("calc").model_copy(update={"risk": RiskTier.MEDIUM})
+          req = PolicyRequest(tool=calc_medi, inputs={"expression": "6*7"})
+          store.grant(req, approver="ci", max_uses=1)
+          assert PolicyGate(temp, store=store).check(req).allowed
+          assert not PolicyGate(temp, store=store).check(req).allowed
+          print("approval replay verified: second check() is refused")
 
           # hardening flags are applied to every container, not just documented
           calc = registry.get("calc")

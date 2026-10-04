@@ -391,6 +391,15 @@ class Sandbox:
         )
         image_digest = self._image_digest()
 
+        # TODO(phase-2): `capture_output=True` buffers the tool's *entire* stdout in
+        # host memory, and MAX_STDOUT_BYTES is only applied after the process has
+        # exited — so it does not bound memory. `--memory` caps the container's RSS,
+        # not the host-side pipe buffer, so a tool that floods stdout can exhaust
+        # host memory faster than the wall-clock timeout can stop it: a host-side
+        # DoS vector for any tool we did not write ourselves. Fix with bounded
+        # streaming (read at most MAX_STDOUT_BYTES + slack from a pipe, then kill
+        # the container; cap the producer side inside the container too).
+        # Tracked as issue #2 "bounded stdout streaming in sandbox".
         timed_out = False
         try:
             proc = subprocess.run(
@@ -495,6 +504,9 @@ class Sandbox:
 
         It exists so the harness can be tested and CI'd on machines without
         Docker. It refuses to run unless ``ULTRON_ALLOW_LOCAL_SANDBOX=1``.
+
+        Same stdout-buffering caveat as the docker path (see the TODO in
+        ``_run_docker`` / issue #2), and no isolation whatsoever.
         """
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),

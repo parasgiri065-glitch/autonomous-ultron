@@ -146,6 +146,12 @@ def eval_settings(*, backend: str, fresh: bool) -> Settings:
         allow_local_sandbox=(backend == "local"),
         # Deterministic fixtures: no network egress in any environment.
         env_allowlist=["ULTRON_WEB_MOCK"],
+        # LOW + network is escalated to a human by default, and the eval runs
+        # unattended, so the research tasks would be refused. The eval is a
+        # controlled harness (its tools read a local fixture corpus, never the
+        # network), so it opts in explicitly. Override with
+        # ULTRON_POLICY_NETWORK_LOW_AUTO=0 to measure the escalation path itself.
+        policy_network_low_auto=os.environ.get("ULTRON_POLICY_NETWORK_LOW_AUTO", "1") == "1",
         # The eval never spends real money: no judge, no synthesis by default.
         enable_llm_judge=os.environ.get("ULTRON_ENABLE_LLM_JUDGE", "0") == "1",
         llm_mode=os.environ.get("ULTRON_LLM_MODE", "auto"),

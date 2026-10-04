@@ -132,6 +132,10 @@ class Settings(BaseModel):
 
     # --- policy ------------------------------------------------------------
     policy_network: Literal["auto", "deny"] = "auto"
+    #: When False (default), a LOW-risk tool that requests network access is
+    #: escalated to MEDIUM and a human is asked. Phase 3 auto-discovers
+    #: manifests, so "LOW + egress runs unattended" is not a safe default.
+    policy_network_low_auto: bool = False
     policy_assume_yes: bool = False
     approvals_file: Path = Field(default=REPO_ROOT / ".ultron" / "approvals.json")
     audit_log: Path = Field(default=REPO_ROOT / ".ultron" / "audit.jsonl")
@@ -204,6 +208,7 @@ def load_settings(**overrides: object) -> Settings:
         "env_allowlist": _env_list("ULTRON_ENV_ALLOWLIST"),
         "docker_bin": _env("ULTRON_DOCKER_BIN", "docker"),
         "policy_network": _env("ULTRON_POLICY_NETWORK", "auto"),
+        "policy_network_low_auto": _env_bool("ULTRON_POLICY_NETWORK_LOW_AUTO", False),
         "policy_assume_yes": _env_bool("ULTRON_POLICY_ASSUME_YES", False),
         "approvals_file": _resolve(_env("ULTRON_APPROVALS_FILE"), state_dir / "approvals.json"),
         "audit_log": _resolve(_env("ULTRON_AUDIT_LOG"), state_dir / "audit.jsonl"),
