@@ -25,6 +25,7 @@ from .cache import Cache
 from .config import get_settings
 from .errors import HumanApprovalRequired, PolicyDenied, SandboxUnavailable, UltronError
 from .forge import ForgeEngine
+from .interfaces.telegram import TelegramBotClient, TelegramCockpit
 from .ledger import FailureLedger
 from .llm import providers_configured
 from .memory import Memory
@@ -409,6 +410,37 @@ def cmd_scavenge(args: argparse.Namespace) -> int:
     return 0 if not report["failed"] else 1
 
 
+def cmd_telegram(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    if not settings.telegram_bot_token:
+        message = (
+            "Telegram is not configured. Set TELEGRAM_BOT_TOKEN and "
+            "TELEGRAM_ALLOWED_USERS (comma-separated numeric user IDs), then run `ultron telegram`."
+        )
+        if args.json:
+            _print_json({"configured": False, "message": message})
+        else:
+            _console().print(message)
+        return 0
+    if not settings.telegram_allowed_user_ids:
+        message = (
+            "Telegram is fail-closed: TELEGRAM_ALLOWED_USERS is empty. "
+            "Set at least one authorized numeric user ID."
+        )
+        if args.json:
+            _print_json({"configured": False, "message": message})
+        else:
+            _console().print(message)
+        return 0
+    client = TelegramBotClient(settings=settings, timeout=args.timeout)
+    cockpit = TelegramCockpit(client, settings=settings)
+    if args.once:
+        cockpit.run_polling(timeout=args.timeout, max_cycles=1)
+    else:
+        cockpit.run_polling(timeout=args.timeout)
+    return 0
+
+
 def _load_eval_module():
     """Import ``eval/run.py`` by path (it deliberately is not a package)."""
     import importlib.util
@@ -510,6 +542,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_scavenge = add_sub("scavenge", help="discover and safely wrap allowlisted OpenAPI specs")
     p_scavenge.add_argument("--max", type=int, default=20, dest="max", help="maximum candidates")
     p_scavenge.set_defaults(func=cmd_scavenge)
+
+    p_telegram = add_sub("telegram", help="start the Telegram cockpit")
+    p_telegram.add_argument("--timeout", type=int, default=20, help="long-poll timeout seconds")
+    p_telegram.add_argument(
+        "--once", action="store_true", help="process one polling cycle and exit"
+    )
+    p_telegram.set_defaults(func=cmd_telegram)
 
     p_doc = add_sub("doctor", help="check the environment")
     p_doc.set_defaults(func=cmd_doctor)

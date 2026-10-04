@@ -76,6 +76,16 @@ def _env_list(name: str) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def _env_int_list(name: str) -> list[int]:
+    values: list[int] = []
+    for item in _env_list(name):
+        try:
+            values.append(int(item))
+        except ValueError as exc:
+            raise ValueError(f"{name} must contain comma-separated integers") from exc
+    return values
+
+
 def _resolve(path_str: str | None, fallback: Path) -> Path:
     if not path_str:
         return fallback
@@ -106,6 +116,10 @@ class Settings(BaseModel):
     # Optional, explicitly enabled network tiers. Defaults remain hermetic.
     allow_zero_auth: bool = False
     scavenge_enabled: bool = False
+
+    # --- Telegram cockpit --------------------------------------------------
+    telegram_bot_token: str | None = None
+    telegram_allowed_user_ids: list[int] = Field(default_factory=list)
 
     # --- budget kill-switch ------------------------------------------------
     budget_max_usd: float = 0.05
@@ -209,6 +223,8 @@ def load_settings(**overrides: object) -> Settings:
         "cost_simulate": _env_bool("ULTRON_COST_SIMULATE", False),
         "allow_zero_auth": _env_bool("ULTRON_ALLOW_ZERO_AUTH", False),
         "scavenge_enabled": _env_bool("ULTRON_SCAVENGE", False),
+        "telegram_bot_token": _env("TELEGRAM_BOT_TOKEN"),
+        "telegram_allowed_user_ids": _env_int_list("TELEGRAM_ALLOWED_USERS"),
         "budget_max_usd": _env_float("ULTRON_BUDGET_MAX_USD", 0.05),
         "budget_max_steps": _env_int("ULTRON_BUDGET_MAX_STEPS", 6),
         "budget_max_seconds": _env_float("ULTRON_BUDGET_MAX_SECONDS", 120.0),
