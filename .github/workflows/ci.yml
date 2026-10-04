@@ -159,6 +159,7 @@ jobs:
           uv run python - <<'PY'
           import json
           import subprocess
+          import time
 
           from ultron.config import load_settings
           from ultron.policy import PolicyGate, PolicyRequest
@@ -254,12 +255,27 @@ jobs:
           assert flooded.meta["stdout_bytes"] > MAX_STDOUT_BYTES, flooded.meta
           assert "[TRUNCATED " in flooded.stdout, flooded.stdout[:120]
           assert not flooded.cacheable
-          # the container is gone: docker kill actually ran
-          leftovers = subprocess.run(
-              ["docker", "ps", "-a", "--filter", f"name={flooded.container}", "--format", "{{.Names}}"],
-              capture_output=True, text=True,
-          ).stdout.strip()
-          assert leftovers == "", f"container survived the cap: {leftovers}"
+          # the kill actually took effect. Two separate claims, because only the
+          # first is synchronous: `docker kill` returns once the container has
+          # stopped, but `--rm` removal is queued on the daemon, so asserting
+          # "gone this instant" would test Docker's queue rather than our sandbox.
+          def _containers(*extra: str) -> str:
+              return subprocess.run(
+                  ["docker", "ps", *extra, "--filter", f"name={flooded.container}",
+                   "--format", "{{.Names}}"],
+                  capture_output=True, text=True,
+              ).stdout.strip()
+
+          running = _containers()
+          assert running == "", f"killed container is still running: {running}"
+          removed = False
+          deadline = time.time() + 20
+          while time.time() < deadline:
+              if _containers("-a") == "":
+                  removed = True
+                  break
+              time.sleep(0.5)
+          assert removed, f"container was not removed within 20s: {flooded.container}"
           print(
               f"bounded stdout verified: capped at {MAX_STDOUT_BYTES} B, "
               f"saw {flooded.meta['stdout_bytes']} B, dropped "
