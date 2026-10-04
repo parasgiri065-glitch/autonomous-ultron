@@ -203,6 +203,25 @@ class Memory:
             )
         return run_id
 
+    def discard_run(self, run_id: str) -> None:
+        """Remove an ungrounded run so it cannot become long-term evidence."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM steps WHERE run_id=?", (run_id,))
+            conn.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
+            # Tool stats are a materialized view over steps. Rebuild it so a
+            # rejected run leaves no historical call/success entry behind.
+            conn.execute("DELETE FROM tool_stats")
+            conn.execute(
+                """INSERT INTO tool_stats
+                   (tool, version, calls, successes, failures, denials, cache_hits,
+                    total_cost_usd, total_ms, last_used_at)
+                   SELECT tool, version, COUNT(*), SUM(ok),
+                          SUM(CASE WHEN ok=0 AND policy_action != 'deny' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN policy_action = 'deny' THEN 1 ELSE 0 END),
+                          SUM(cached), SUM(cost_usd), SUM(duration_s * 1000), MAX(created_at)
+                   FROM steps GROUP BY tool, version"""
+            )
+
     def finish_run(self, record: RunRecord) -> None:
         with self._connect() as conn:
             conn.execute(
