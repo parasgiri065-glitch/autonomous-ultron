@@ -65,6 +65,22 @@ and the tool's partial stdout is *not* treated as a result.
   manifest's content hash, so editing a tool invalidates both.
 * **The host is trusted.** Docker and the operator are inside the TCB.
 
+## Bounded output (issue #2, fixed in phase 2.0)
+
+The sandbox streams tool stdout/stderr through a bounded window instead of buffering the
+process: the host keeps at most `MAX_STDOUT_BYTES` (4 MB) per stream, keeps the **tail**
+(so the JSON envelope still parses), and the moment a stream overflows it kills the
+producer — `docker kill <name>` for containers, a process-group SIGKILL for the local
+backend — and reports `ok=False` with a `[TRUNCATED n bytes]` marker. `n` counts bytes
+evicted from our window, not the tool's true total: reading stops at the cap on purpose.
+Verified by a 10 MB flooder in `tests/test_smoke.py` and against real Docker in CI.
+
+Live network mode (`ULTRON_EVAL_LIVE=1`, local/manual only) changes **no** container
+property: the repo stays the only volume and stays `:ro`, and the only writable path inside
+the container remains the noexec tmpfs. The URL-keyed page cache is a local-backend
+feature precisely so that enabling egress never requires widening the mount set --
+`approvals.json`, `audit.jsonl` and `memory.db` are never reachable from a container.
+
 ## Known limits (deliberate, Phase 1)
 
 * **Docker is the boundary, not a VM.** A kernel LPE escapes it. Use rootless

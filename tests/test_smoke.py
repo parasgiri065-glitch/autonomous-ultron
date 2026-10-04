@@ -46,6 +46,11 @@ from ultron.router import Router
 from ultron.sandbox import Sandbox, parse_envelope
 from ultron.verifier import Verifier
 
+#: Pristine Popen, captured before any test patches the module attribute. Using
+#: ``subprocess.Popen`` directly inside a wrapper would re-wrap an earlier
+#: wrapper and let two tests see each other's calls.
+_REAL_POPEN = subprocess.Popen
+
 RESEARCH_FIXTURE_TEXT = (
     "Community water fluoridation adjusts the fluoride concentration in public drinking water "
     "to prevent tooth decay and reviews report a reduction in dental caries."
@@ -73,9 +78,14 @@ def settings(tmp_path: Path):
         # accepted LOW+network auto-run". The fail-closed default is asserted
         # separately in the escalation tests below.
         policy_network_low_auto=True,
-        # Tools read the fixture corpus instead of the network; only allowlisted,
-        # non-secret names cross into the sandbox.
-        env_allowlist=["ULTRON_WEB_MOCK"],
+        # Tools read the fixture corpus instead of the network. This is a
+        # Settings value, not an os.environ write: the sandbox injects it into
+        # the tool process from the instance it holds (phase 2.0, item 1).
+        web_mock=str(REPO_ROOT / "eval" / "fixtures" / "web_mock.json"),
+        eval_live=False,  # live egress is opt-in and never used by tests
+        # Only allowlisted, non-secret names from the ambient env cross into the
+        # sandbox; the fixture corpus above does not depend on this channel.
+        env_allowlist=[],
     )
 
 
@@ -292,6 +302,7 @@ def test_sandbox_result_reports_both_network_semantics(settings, registry):
 
 
 def test_scrub_env_drops_secret_looking_names(monkeypatch):
+    """The ambient allowlist is still a channel -- secrets never travel on it."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-leak")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_should_not_leak")
     monkeypatch.setenv("ULTRON_WEB_MOCK", "/tmp/mock.json")
@@ -321,14 +332,15 @@ def test_sandbox_executes_tool_and_caches_the_result(settings, registry, monkeyp
     manifest = registry.get("calc")
     decision = low_risk_decision()
 
+    # Count *tool spawns*. The executor streams pipes itself (issue #2), so the
+    # thing to watch is Popen, not subprocess.run.
     calls = {"n": 0}
-    real_run = subprocess.run
 
-    def counting_run(*args, **kwargs):
+    def counting_popen(*args, **kwargs):
         calls["n"] += 1
-        return real_run(*args, **kwargs)
+        return _REAL_POPEN(*args, **kwargs)
 
-    monkeypatch.setattr("ultron.sandbox.subprocess.run", counting_run)
+    monkeypatch.setattr("ultron.sandbox.subprocess.Popen", counting_popen)
 
     first = sandbox.run(manifest, {"expression": "12*(3+4)"}, decision)
     assert first.ok and first.result["result"] == 84.0
@@ -883,8 +895,9 @@ def test_agent_full_loop_on_deterministic_tool(settings):
     assert again.steps == [] and again.latency_s < result.latency_s + 1
 
 
-def test_agent_research_loop_uses_fixtures_and_verifies(settings, monkeypatch):
-    monkeypatch.setenv("ULTRON_WEB_MOCK", str(REPO_ROOT / "eval" / "fixtures" / "web_mock.json"))
+def test_agent_research_loop_uses_fixtures_and_verifies(settings):
+    # No env patching: the fixture corpus is on the Settings object, which is
+    # what the sandbox reads. A stray ambient ULTRON_WEB_MOCK cannot affect it.
     agent = Agent(settings=settings, sandbox_backend="local")
     result = agent.run("research the public health impact of community water fluoridation")
     assert result.status == "ok", result.notes
@@ -971,3 +984,464 @@ def test_eval_harness_smoke(tmp_path, monkeypatch):
     assert all(isinstance(g.ok, bool) for g in report.gates)
     assert report.exit_code in (0, 1)
     assert report.as_dict()["metrics"]["cache_hit_rate"] >= 0.0
+
+
+# ============================================================ phase 2.0 — item 1
+# web_mock is a Settings value, injected by the sandbox into the tool process.
+def _capture_tool_env(monkeypatch, sandbox, manifest, inputs, decision):
+    """Run a tool through the local backend and return the env it was given."""
+    seen: dict[str, str] = {}
+
+    def recording_popen(*args, **kwargs):
+        seen.update(kwargs.get("env") or {})
+        return _REAL_POPEN(*args, **kwargs)
+
+    monkeypatch.setattr("ultron.sandbox.subprocess.Popen", recording_popen)
+    result = sandbox.run(manifest, inputs, decision, use_cache=False)
+    assert result.ok, result.error
+    return seen
+
+
+def test_web_mock_is_scoped_to_its_settings_instance(tmp_path, monkeypatch):
+    """Two Settings with different fixtures must not contaminate each other."""
+    import os
+
+    from ultron.sandbox import Sandbox
+
+    def build(name: str, fixture: str):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "legacy").mkdir(exist_ok=True)
+        return load_settings(
+            state_dir=root,
+            cache_path=root / "cache.db",
+            memory_path=root / "memory.db",
+            approvals_file=root / "approvals.json",
+            audit_log=root / "audit.jsonl",
+            web_cache_path=root / "webcache.db",
+            sandbox_backend="local",
+            allow_local_sandbox=True,
+            llm_mode="offline",
+            env_allowlist=[],
+            web_mock=fixture,
+        )
+
+    first = build("a", str(tmp_path / "a.json"))
+    second = build("b", str(tmp_path / "b.json"))
+    assert first.web_mock != second.web_mock
+
+    manifest = ToolManifest(
+        name="calc",
+        version="0.1.0",
+        entrypoint="python -m tools.calc",
+        risk=RiskTier.LOW,
+        inputs={"expression": "string"},
+    )
+    # An ambient value that must NOT win over either Settings instance.
+    monkeypatch.setenv("ULTRON_WEB_MOCK", "/ambient/leak.json")
+    before = os.environ.get("ULTRON_WEB_MOCK")
+
+    env_a = _capture_tool_env(
+        monkeypatch,
+        Sandbox(first, backend="local"),
+        manifest,
+        {"expression": "1+1"},
+        low_risk_decision(),
+    )
+    env_b = _capture_tool_env(
+        monkeypatch,
+        Sandbox(second, backend="local"),
+        manifest,
+        {"expression": "1+1"},
+        low_risk_decision(),
+    )
+
+    assert env_a["ULTRON_WEB_MOCK"] == str(tmp_path / "a.json")
+    assert env_b["ULTRON_WEB_MOCK"] == str(tmp_path / "b.json")
+    assert "ULTRON_WEB_MOCK" in env_a and env_a["ULTRON_WEB_MOCK"] != env_b["ULTRON_WEB_MOCK"]
+    # Nothing was written to the process environment by either run.
+    assert os.environ.get("ULTRON_WEB_MOCK") == before == "/ambient/leak.json"
+
+
+def test_eval_settings_scopes_web_mock_without_touching_os_environ(tmp_path, monkeypatch):
+    """The eval passes the fixture path down; it never mutates the process env."""
+    import importlib.util
+    import os
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "ultron_eval_scoping", REPO_ROOT / "eval" / "run.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    monkeypatch.setenv("ULTRON_WEB_MOCK", "/should/be/ignored.json")
+    monkeypatch.delenv("ULTRON_EVAL_LIVE", raising=False)
+    settings = module.eval_settings(backend="local", fresh=False)
+
+    assert settings.web_mock == str(REPO_ROOT / "eval" / "fixtures" / "web_mock.json")
+    assert os.environ["ULTRON_WEB_MOCK"] == "/should/be/ignored.json"  # untouched
+    assert settings.eval_live is False  # the eval is hermetic, always
+
+
+def test_docker_argv_translates_the_fixture_into_the_container(settings, registry):
+    """A host path is rewritten to the read-only /workspace mount for docker."""
+    sandbox = Sandbox(settings, backend="docker")
+    argv = sandbox.docker_command_preview(registry.get("calc"), low_risk_decision())
+    joined = " ".join(argv)
+    assert "-e ULTRON_WEB_MOCK=/workspace/eval/fixtures/web_mock.json" in joined
+    # already-container paths are passed through verbatim
+    assert sandbox._container_path("/workspace/x.json") == "/workspace/x.json"
+
+
+# ============================================================ phase 2.0 — item 3
+def test_no_mode_adds_a_writable_mount(tmp_path, registry):
+    """The container is read-only + tmpfs, in every mode. No exceptions."""
+    for live in (False, True):
+        root = tmp_path / f"live={live}"
+        root.mkdir()
+        configured = load_settings(
+            state_dir=root,
+            cache_path=root / "cache.db",
+            memory_path=root / "m.db",
+            approvals_file=root / "approvals.json",
+            audit_log=root / "audit.jsonl",
+            web_cache_path=root / "webcache" / "webcache.db",
+            eval_live=live,
+            sandbox_backend="docker",
+            llm_mode="offline",
+        )
+        argv = Sandbox(configured, backend="docker").docker_command_preview(
+            registry.get("web_research"), low_risk_decision("http")
+        )
+        mounts = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-v"]
+        assert mounts == [f"{REPO_ROOT}:/workspace:ro"], mounts
+        assert not [m for m in mounts if m.endswith(":rw")]
+        assert (
+            "ULTRON_EVAL_LIVE=1" in " ".join(argv)
+            if live
+            else ("ULTRON_EVAL_LIVE" not in " ".join(argv))
+        )
+        # the page cache path is never handed to a container: no writable mount
+        # means a cache there could not survive a run anyway
+        assert "ULTRON_WEB_CACHE" not in " ".join(argv)
+
+
+def test_live_mode_gives_the_local_backend_the_url_cache(tmp_path):
+    """The page cache is a local-backend feature, wired through Settings/env."""
+    root = tmp_path / "live"
+    root.mkdir()
+    configured = load_settings(
+        state_dir=root,
+        cache_path=root / "cache.db",
+        memory_path=root / "m.db",
+        approvals_file=root / "approvals.json",
+        audit_log=root / "audit.jsonl",
+        web_cache_path=root / "webcache" / "webcache.db",
+        eval_live=True,
+        sandbox_backend="local",
+        allow_local_sandbox=True,
+        llm_mode="offline",
+    )
+    sandbox = Sandbox(configured, backend="local")
+    env = sandbox._tool_env()
+    assert env["ULTRON_EVAL_LIVE"] == "1"
+    assert env["ULTRON_WEB_CACHE"] == str(root / "webcache" / "webcache.db")
+    assert env["ULTRON_CACHE_TTL_WEB"] == str(configured.cache_ttl_web)
+    # a container gets neither the path nor a mount for it
+    assert "ULTRON_WEB_CACHE" not in sandbox._tool_env(container=True)
+
+
+def test_offline_default_carries_no_live_markers(settings, registry):
+    sandbox = Sandbox(settings, backend="docker")
+    argv = sandbox.docker_command_preview(registry.get("web_research"), low_risk_decision("http"))
+    assert "ULTRON_EVAL_LIVE" not in " ".join(argv)
+    assert "ULTRON_WEB_CACHE" not in " ".join(argv)
+
+
+def test_eval_live_env_flag_parsing(monkeypatch):
+    monkeypatch.delenv("ULTRON_EVAL_LIVE", raising=False)
+    assert load_settings().eval_live is False
+    monkeypatch.setenv("ULTRON_EVAL_LIVE", "1")
+    assert load_settings().eval_live is True
+    monkeypatch.setenv("ULTRON_EVAL_LIVE", "off")
+    assert load_settings().eval_live is False
+
+
+def test_url_cache_hits_and_expires(tmp_path, monkeypatch):
+    """The URL-keyed cache: one fetch per URL per TTL window."""
+    import time
+
+    from tools._webcache import WebCache, normalize_url
+
+    assert normalize_url("https://x.test/a#frag") == "https://x.test/a"
+    monkeypatch.setenv("ULTRON_EVAL_LIVE", "1")
+    monkeypatch.setenv("ULTRON_WEB_CACHE", str(tmp_path / "web.db"))
+    monkeypatch.setenv("ULTRON_CACHE_TTL_WEB", "60")
+    cache = WebCache(str(tmp_path / "web.db"), 60)
+
+    assert cache.get("https://x.test/a") is None  # miss
+    cache.set("https://x.test/a", "hello")
+    assert cache.get("https://x.test/a") == "hello"  # hit
+    assert cache.get("https://x.test/a#frag") == "hello"  # fragment-free key
+    assert (cache.hits, cache.misses) == (2, 1)
+
+    cache.set("https://x.test/b", "stale", ttl_s=-1)  # already expired
+    assert cache.get("https://x.test/b") is None
+    assert WebCache(str(tmp_path / "off.db"), 0).get("https://x.test/a") is None
+    # the tool-side cache speaks the harness schema, so the harness can read it
+    harness = Cache(load_settings(cache_path=tmp_path / "web.db"))
+    assert harness.get("web", "https://x.test/a") is not None
+    assert time.time() > 0
+
+
+def test_tools_stay_offline_unless_live_mode_is_on(tmp_path, monkeypatch):
+    from tools import _webcache
+
+    for var in ("ULTRON_EVAL_LIVE", "ULTRON_WEB_CACHE"):
+        monkeypatch.delenv(var, raising=False)
+    assert _webcache.live_enabled() is False
+    assert _webcache.maybe_cache() is None  # no cache, and no live egress
+    monkeypatch.setenv("ULTRON_EVAL_LIVE", "1")
+    monkeypatch.setenv("ULTRON_WEB_CACHE", str(tmp_path / "web.db"))
+    assert _webcache.live_enabled() is True
+    assert _webcache.maybe_cache() is not None
+    monkeypatch.setenv("ULTRON_EVAL_LIVE", "0")
+    assert _webcache.maybe_cache() is None
+
+
+# ============================================================ phase 2.0 — item 2
+# Bounded stdout streaming (issue #2): the host must never buffer a flood.
+def test_stream_capture_keeps_the_tail_and_marks_truncation():
+    """Truncation drops the HEAD, so the JSON envelope on the last line lives."""
+    import io
+    import threading
+
+    from ultron.sandbox import READ_CHUNK_BYTES, StreamCapture, _KillOnce, _pump
+
+    limit = 64 * 1024
+    envelope = b'{"ok": true, "result": {"answer": 42}}\n'
+    # Layout chosen so the assertions mean something: the marker-worded head is
+    # smaller than the evicted prefix, and the envelope sits inside the retained
+    # tail window (which is where a tool's envelope lives).
+    # Sizes matter: the payload is >2 read chunks, so the cap trips on a *full*
+    # chunk with more still pending (that is when "stop reading" is observable).
+    head = b"HEAD\n" * 1_000  # 5 000 B -- must be evicted
+    mid = b"MID\n" * 22_000  # 88 000 B -- filler between head and envelope
+    tail = b"TAIL\n" * 20_000  # 80 000 B -- after the envelope, inside the window
+    payload = head + mid + envelope + tail
+    capture = StreamCapture()
+    proc = type("P", (), {"pid": 0})()
+    over = _KillOnce(None)
+    _pump(io.BytesIO(payload), capture, limit, over, proc)
+
+    text = capture.text()
+    assert len(capture.kept) <= limit, "host must not hold more than the cap"
+    assert over.fired is True, "the cap must fire the kill hook"
+    # reading stopped at the cap instead of draining the whole payload
+    assert capture.total < len(payload), (capture.total, len(payload))
+    assert capture.dropped == capture.total - limit
+    assert capture.truncated is True
+    assert text.startswith(f"[TRUNCATED {capture.dropped} bytes]")
+    assert "HEAD" not in text, "the head is what gets dropped"
+    assert "TAIL" in text, "the tail is what survives"
+    envelope_out, error = parse_envelope(text)
+    assert error is None, error
+    assert envelope_out["result"]["answer"] == 42
+    assert READ_CHUNK_BYTES == 64 * 1024
+    assert isinstance(threading.Event(), threading.Event)
+
+
+def test_run_bounded_kills_a_flooding_producer(tmp_path):
+    """A synthetic 10 MB emitter: capped, killed, and the host stays small."""
+    import signal
+    import time
+
+    from ultron.sandbox import MAX_STDOUT_BYTES, _kill_process_tree, run_bounded
+
+    flood = REPO_ROOT / "tests" / "fixtures" / "flood_stdout.py"
+    assert flood.exists()
+    killed: list[int] = []
+    started = time.perf_counter()
+    run = run_bounded(
+        [sys.executable, str(flood), "10"],
+        timeout_s=30,
+        limit=MAX_STDOUT_BYTES,
+        start_new_session=True,
+        on_limit=lambda proc: (killed.append(proc.pid), _kill_process_tree(proc)),
+    )
+    elapsed = time.perf_counter() - started
+
+    assert run.spawned and run.capped is True
+    assert killed, "hitting the cap must kill the producer"
+    assert run.timed_out is False
+    assert run.stdout_bytes > MAX_STDOUT_BYTES, run.stdout_bytes
+    assert run.stdout_dropped > 0
+    assert run.stdout.startswith("[TRUNCATED ")
+    assert len(run.stdout) <= MAX_STDOUT_BYTES + 64, "stdout must stay bounded"
+    assert run.exit_code != 0, "a killed producer must not report success"
+    assert elapsed < 20, "the kill must not wait for the 30s timeout"
+    assert signal.SIGKILL  # the process-group kill path is exercised above
+
+
+def test_local_backend_fails_a_tool_that_floods_stdout(settings, registry):
+    """End-to-end: flood -> capped result, ok False, marker in stdout."""
+    from ultron.sandbox import MAX_STDOUT_BYTES, Sandbox
+
+    flooder = ToolManifest(
+        name="flood_probe",
+        version="0.1.0",
+        entrypoint="python tests/fixtures/flood_stdout.py",
+        risk=RiskTier.LOW,
+        description="test fixture: writes 10 MB to stdout",
+    )
+    sandbox = Sandbox(settings, backend="local")
+    result = sandbox.run(flooder, {}, low_risk_decision(), use_cache=False)
+
+    assert result.ok is False
+    assert result.error and "exceeded" in result.error
+    assert result.meta["output_capped"] is True
+    assert result.meta["stdout_bytes"] > MAX_STDOUT_BYTES
+    assert "[TRUNCATED " in result.stdout
+    # nothing about this may land in the cache: a killed run is not an answer
+    assert result.cacheable is False
+
+
+def test_bounded_run_reports_a_missing_binary():
+    from ultron.sandbox import run_bounded
+
+    run = run_bounded(["/nonexistent/definitely-not-a-binary"], timeout_s=5)
+    assert run.spawned is False and run.spawn_error and run.exit_code is None
+
+
+def test_stderr_is_capped_too(tmp_path):
+    """The cap applies per stream, and stderr keeps its own tail."""
+    import sys as _sys
+
+    from ultron.sandbox import run_bounded
+
+    script = (
+        "import sys\n"
+        'sys.stdout.write(\'{"ok": true, "result": {}}\\n\')\n'
+        "sys.stdout.flush()\n"
+        "for _ in range(6): sys.stderr.write('e' * 1024 * 1024)\n"
+    )
+    run = run_bounded([_sys.executable, "-c", script], timeout_s=30, limit=1024 * 1024)
+    assert run.capped is True
+    assert run.stderr_dropped > 0 and run.stdout_dropped == 0
+    assert run.stderr.startswith("[TRUNCATED ")
+    assert len(run.stderr) <= 1024 * 1024 + 64
+    assert parse_envelope(run.stdout)[0] == {"ok": True, "result": {}}
+
+
+def test_run_bounded_kills_a_tool_that_runs_too_long():
+    """The timeout path, rewritten in phase 2.0, must still kill and report."""
+    import time as _time
+
+    from ultron.sandbox import run_bounded
+
+    started = _time.perf_counter()
+    run = run_bounded(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout_s=1.0,
+        start_new_session=True,
+    )
+    elapsed = _time.perf_counter() - started
+    assert run.timed_out is True
+    assert run.exit_code != 0, "a killed tool must not report exit 0"
+    assert elapsed < 10, f"the kill must not wait for the tool (took {elapsed:.1f}s)"
+
+
+def test_local_backend_reports_a_hung_tool_as_timed_out(settings):
+    """End-to-end: a hung tool is killed, flagged and never cached."""
+    sleeper = ToolManifest(
+        name="sleep_probe",
+        version="0.1.0",
+        entrypoint="python tests/fixtures/sleep_tool.py 30",
+        risk=RiskTier.LOW,
+        description="test fixture: hangs until killed",
+    )
+    decision = low_risk_decision()
+    decision.limits["timeout_s"] = 1.0
+    sandbox = Sandbox(settings, backend="local")
+    import time
+
+    started = time.perf_counter()
+    result = sandbox.run(sleeper, {}, decision, use_cache=False)
+    elapsed = time.perf_counter() - started
+
+    assert result.timed_out is True and result.ok is False
+    assert result.error and "timeout" in result.error
+    assert elapsed < 10, f"the sandbox must kill the tool, not wait for it ({elapsed:.1f}s)"
+    assert result.cacheable is False
+
+
+# ---- the kill must be verified, not just requested (found by the CI docker job)
+def _fake_docker(tmp_path, *, running_forever: bool, inspected: str | None = None):
+    """A stand-in for the docker CLI: records calls, answers `inspect`.
+
+    Lets the kill-verification loop be tested without a daemon -- which is the
+    point: the loop only exists on the docker path.
+    """
+    calls = tmp_path / "calls.log"
+    script = tmp_path / "fake-docker"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"log = pathlib.Path({str(calls)!r})\n"
+        "log.write_text((log.read_text() if log.exists() else '') + ' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1] == 'kill':\n"
+        "    sys.exit(0)\n"
+        f"if {bool(running_forever)}:\n"
+        f"    print({(inspected or 'true')!r}); sys.exit(0)\n"
+        "counter = log.with_suffix('.n')\n"
+        "n = int(counter.read_text()) if counter.exists() else 0\n"
+        "counter.write_text(str(n + 1))\n"
+        "print('true' if n < 2 else 'false')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script, calls
+
+
+def _sandbox_with_docker(tmp_path, binary):
+    configured = load_settings(
+        state_dir=tmp_path,
+        cache_path=tmp_path / "c.db",
+        memory_path=tmp_path / "m.db",
+        approvals_file=tmp_path / "a.json",
+        audit_log=tmp_path / "x.jsonl",
+        docker_bin=str(binary),
+        llm_mode="offline",
+    )
+    return Sandbox(configured, backend="docker")
+
+
+def test_kill_is_retried_until_the_container_stops(tmp_path):
+    binary, calls = _fake_docker(tmp_path, running_forever=False)
+    sandbox = _sandbox_with_docker(tmp_path, binary)
+    assert sandbox._ensure_container_stopped("ultron-x", grace_s=3.0) is True
+    log = calls.read_text()
+    assert "inspect" in log, log
+    assert "kill" in log, "the retry must re-issue the kill while it is still running"
+
+
+def test_kill_reports_failure_when_the_container_never_stops(tmp_path):
+    binary, calls = _fake_docker(tmp_path, running_forever=True)
+    sandbox = _sandbox_with_docker(tmp_path, binary)
+    assert sandbox._ensure_container_stopped("ultron-x", grace_s=0.6) is False
+    assert calls.read_text().count("kill") >= 1
+
+
+def test_a_removed_container_counts_as_stopped(tmp_path):
+    binary, calls = _fake_docker(tmp_path, running_forever=True)
+    script = binary.read_text().replace(
+        "if sys.argv[1] == 'kill':\n    sys.exit(0)",
+        "if sys.argv[1] == 'kill':\n    sys.exit(0)\nif sys.argv[1] == 'inspect':\n    sys.exit(1)  # gone",
+    )
+    binary.write_text(script, encoding="utf-8")
+    sandbox = _sandbox_with_docker(tmp_path, binary)
+    assert sandbox._ensure_container_stopped("ultron-x", grace_s=0.6) is True
+    assert "kill" not in calls.read_text()

@@ -158,6 +158,9 @@ jobs:
         run: |
           uv run python - <<'PY'
           import json
+          import subprocess
+          import time
+
           from ultron.config import load_settings
           from ultron.policy import PolicyGate, PolicyRequest
           from ultron.registry import Registry, RiskTier
@@ -230,6 +233,88 @@ jobs:
                        "--pids-limit", "--memory", "--tmpfs", "/workspace:ro"):
               assert flag in preview, f"missing hardening flag: {flag}"
           print("container hardening flags verified")
+          # bounded stdout (issue #2): a 10 MB flooder must be killed mid-flight,
+          # not buffered. This is the only place the docker kill path is proven --
+          # the sandbox has no docker daemon, so the unit tests cover the local
+          # backend and this job covers the container.
+          from ultron.registry import RiskTier, ToolManifest
+          from ultron.sandbox import MAX_STDOUT_BYTES
+
+          flooder = ToolManifest(
+              name="flood_probe",
+              version="0.1.0",
+              entrypoint="python tests/fixtures/flood_stdout.py",
+              risk=RiskTier.LOW,
+              description="ci fixture: writes 10 MB to stdout",
+          )
+          flood_decision = gate.check(PolicyRequest(tool=flooder, inputs={}, goal="ci"))
+          assert flood_decision.action == "allow", flood_decision.reason
+          flooded = sandbox.run(flooder, {}, flood_decision, use_cache=False)
+          assert flooded.ok is False, "a flooder must not produce an ok result"
+          assert flooded.meta["output_capped"] is True, flooded.meta
+          assert flooded.meta["stdout_bytes"] > MAX_STDOUT_BYTES, flooded.meta
+          assert "[TRUNCATED " in flooded.stdout, flooded.stdout[:120]
+          assert not flooded.cacheable
+          # the kill actually took effect. Two separate claims, because only the
+          # first is synchronous: `docker kill` returns once the container has
+          # stopped, but `--rm` removal is queued on the daemon, so asserting
+          # "gone this instant" would test Docker's queue rather than our sandbox.
+          def _containers(*extra: str) -> str:
+              return subprocess.run(
+                  ["docker", "ps", *extra, "--filter", f"name={flooded.container}",
+                   "--format", "{{.Names}}"],
+                  capture_output=True, text=True,
+              ).stdout.strip()
+
+          # the sandbox verifies its own kill before returning (see
+          # Sandbox._ensure_container_stopped) -- a request that silently failed
+          # would leave a runaway tool alive, which is the whole point of the cap.
+          assert flooded.meta.get("container_stopped") is True, flooded.meta
+          running = _containers()
+          assert running == "", f"killed container is still running: {running}"
+          removed = False
+          deadline = time.time() + 20
+          while time.time() < deadline:
+              if _containers("-a") == "":
+                  removed = True
+                  break
+              time.sleep(0.5)
+          assert removed, f"container was not removed within 20s: {flooded.container}"
+          print(
+              f"bounded stdout verified: capped at {MAX_STDOUT_BYTES} B, "
+              f"saw {flooded.meta['stdout_bytes']} B, dropped "
+              f"{flooded.meta['stdout_dropped']} B, container killed"
+          )
+
+          # read-only container, in every mode: the repo mount is the only -v,
+          # and it is :ro. Live mode adds no writable mount either.
+          from ultron.sandbox import Sandbox as _Sandbox
+
+          wr = registry.get("web_research")
+          live_settings = load_settings(eval_live=True)
+          for label, argv in (
+              ("default", sandbox.docker_command_preview(
+                  wr, gate.check(PolicyRequest(tool=wr, inputs={"query": "x", "max_sources": 1}, goal="ci")))),
+              ("live", _Sandbox(live_settings, backend="docker").docker_command_preview(
+                  wr, gate.check(PolicyRequest(tool=wr, inputs={"query": "x", "max_sources": 1}, goal="ci")))),
+          ):
+              mounts = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-v"]
+              # exactly one volume: the checkout, mounted read-only at /workspace.
+              # The host side is wherever CI checked the repo out, so match the
+              # container side and the :ro flag rather than a hardcoded path.
+              assert len(mounts) == 1, (label, mounts)
+              assert mounts[0].endswith(":/workspace:ro"), (label, mounts)
+              assert not [m for m in mounts if m.endswith(":rw")], (label, mounts)
+              assert not [a for a in argv if a.startswith("ULTRON_WEB_CACHE")], (label, argv)
+          assert "ULTRON_EVAL_LIVE=1" not in " ".join(
+              sandbox.docker_command_preview(
+                  wr, gate.check(PolicyRequest(tool=wr, inputs={"query": "x", "max_sources": 1}, goal="ci"))))
+          assert "ULTRON_EVAL_LIVE=1" in " ".join(
+              _Sandbox(live_settings, backend="docker").docker_command_preview(
+                  wr, gate.check(PolicyRequest(tool=wr, inputs={"query": "x", "max_sources": 1}, goal="ci"))))
+          print("read-only verified: one :ro mount in both modes, no writable mount, "
+                "no page-cache path in the container env")
+
           # a tool that is denied never reaches docker at all
           denied = gate.check(PolicyRequest(tool=registry.get("http_fetch"),
                                             inputs={"url": "https://example.com", "max_bytes": 100}))

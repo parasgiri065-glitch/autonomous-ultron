@@ -3,6 +3,10 @@
 Because it declares ``network:http`` **and** ``risk: medium``, the policy gate
 will not run it unattended: it produces an approval request instead. Use it to
 exercise the human-in-the-loop path (see tests/test_smoke.py).
+
+Modes, in precedence order: ``ULTRON_WEB_MOCK`` (fixtures, used by tests/CI),
+then ``ULTRON_EVAL_LIVE=1`` (real network + URL-keyed SQLite page cache keyed on
+the URL, TTL from ``ULTRON_CACHE_TTL_WEB``), then plain live HTTP as before.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
+from tools import _webcache
 from tools._io import main_guard, optional, require
 
 ALLOWED_SCHEMES = {"http", "https"}
@@ -48,15 +53,28 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     import httpx
 
-    with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-        resp = client.get(url)
-    text = resp.text[:max_bytes]
-    return {
-        "status": resp.status_code,
-        "url": str(resp.url),
+    cache = _webcache.maybe_cache()
+    raw: str | None = cache.get(url) if cache is not None else None
+    if raw is None:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+            resp = client.get(url)
+            status, final_url, raw = resp.status_code, str(resp.url), resp.text
+        if cache is not None:
+            cache.set(url, raw)
+    else:
+        status, final_url = 200, url  # served from the URL-keyed cache
+    text = raw[:max_bytes]
+    payload: dict[str, Any] = {
+        "status": status,
+        "url": final_url,
         "text": text,
-        "truncated": len(resp.text) > max_bytes,
+        "truncated": len(raw) > max_bytes,
     }
+    if cache is not None:
+        # Live runs only. An undeclared field is a verifier *warning*, never a
+        # failure, and the operator asked for live mode to see exactly this.
+        payload["_meta"] = {"mode": "live", "cache": cache.stats()}
+    return payload
 
 
 if __name__ == "__main__":
