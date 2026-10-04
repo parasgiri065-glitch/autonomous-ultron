@@ -299,7 +299,11 @@ jobs:
                   wr, gate.check(PolicyRequest(tool=wr, inputs={"query": "x", "max_sources": 1}, goal="ci")))),
           ):
               mounts = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-v"]
-              assert mounts == ["/workspace:/workspace:ro"], (label, mounts)
+              # exactly one volume: the checkout, mounted read-only at /workspace.
+              # The host side is wherever CI checked the repo out, so match the
+              # container side and the :ro flag rather than a hardcoded path.
+              assert len(mounts) == 1, (label, mounts)
+              assert mounts[0].endswith(":/workspace:ro"), (label, mounts)
               assert not [m for m in mounts if m.endswith(":rw")], (label, mounts)
               assert not [a for a in argv if a.startswith("ULTRON_WEB_CACHE")], (label, argv)
           assert "ULTRON_EVAL_LIVE=1" not in " ".join(
