@@ -25,6 +25,7 @@ from .cache import Cache
 from .config import get_settings
 from .errors import HumanApprovalRequired, PolicyDenied, SandboxUnavailable, UltronError
 from .forge import ForgeEngine
+from .harvester import HarvestError, PyPIHarvester
 from .interfaces.telegram import TelegramBotClient, TelegramCockpit
 from .ledger import FailureLedger
 from .llm import providers_configured
@@ -410,6 +411,79 @@ def cmd_scavenge(args: argparse.Namespace) -> int:
     return 0 if not report["failed"] else 1
 
 
+def cmd_harvest(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    harvester = PyPIHarvester(settings)
+    try:
+        metadata = harvester.inspect_package(args.package_name)
+        output_key = args.output_key
+        inputs = json.loads(args.test_input) if args.test_input else {}
+        if not isinstance(inputs, dict):
+            raise HarvestError("--test-input must be a JSON object")
+        code, manifest = harvester.synthesize_wrapper(
+            metadata,
+            args.function,
+            {key: _infer_cli_type(value) for key, value in inputs.items()},
+            output_key,
+        )
+        if args.dry_run:
+            payload = {
+                "package": metadata.name,
+                "version": metadata.version,
+                "license": metadata.license,
+                "modules": metadata.top_level_modules,
+                "manifest": manifest,
+                "wrapper_bytes": len(code.encode("utf-8")),
+                "dry_run": True,
+            }
+        else:
+            expected = {output_key: "any"}
+            tool = harvester.harvest_and_forge(args.package_name, args.function, inputs, expected)
+            payload = {
+                "package": metadata.name,
+                "version": metadata.version,
+                "license": metadata.license,
+                "tool": tool.key,
+                "risk": tool.risk.value,
+                "provides": tool.provides,
+                "dry_run": False,
+            }
+    except (HarvestError, json.JSONDecodeError) as exc:
+        if args.json:
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            _console().print(f"[red]harvest failed[/red]: {exc}")
+        return 1
+    if args.json:
+        _print_json({"ok": True, **payload})
+    else:
+        from rich.table import Table
+
+        table = Table(title="PyPI harvest", header_style="bold")
+        table.add_column("field")
+        table.add_column("value")
+        for key, value in payload.items():
+            table.add_row(
+                key, json.dumps(value, default=str) if not isinstance(value, str) else value
+            )
+        _console().print(table)
+    return 0
+
+
+def _infer_cli_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, list):
+        return "list[string]"
+    if isinstance(value, dict):
+        return "dict"
+    return "string"
+
+
 def cmd_telegram(args: argparse.Namespace) -> int:
     settings = get_settings()
     if not settings.telegram_bot_token:
@@ -542,6 +616,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_scavenge = add_sub("scavenge", help="discover and safely wrap allowlisted OpenAPI specs")
     p_scavenge.add_argument("--max", type=int, default=20, dest="max", help="maximum candidates")
     p_scavenge.set_defaults(func=cmd_scavenge)
+
+    p_harvest = add_sub("harvest", help="inspect and optionally forge an allowlisted PyPI package")
+    p_harvest.add_argument("package_name")
+    p_harvest.add_argument("--function", default="main", help="dotted target function")
+    p_harvest.add_argument("--test-input", default="{}", help="JSON object passed to the wrapper")
+    p_harvest.add_argument("--output-key", default="result", help="manifest output field")
+    p_harvest.add_argument("--dry-run", action="store_true", help="inspect and synthesize only")
+    p_harvest.set_defaults(func=cmd_harvest)
 
     p_telegram = add_sub("telegram", help="start the Telegram cockpit")
     p_telegram.add_argument("--timeout", type=int, default=20, help="long-poll timeout seconds")
