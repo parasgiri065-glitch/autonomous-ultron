@@ -21,7 +21,8 @@ What it does
    ``ULTRON_EVAL_MAX_AVG_LATENCY_S``, or if the run regresses against
    ``eval/baseline.json``.
 
-Network is never required: tools read a fixture corpus via ``ULTRON_WEB_MOCK``.
+Network is never required: tools read a fixture corpus (``web_mock``, set on the
+Settings this module builds — not via a process-wide environment write).
 Policy behaviour is part of the contract — a medium-risk tool that refuses to run
 unattended *passes* its task, because refusing is the correct outcome.
 """
@@ -135,7 +136,6 @@ def eval_settings(*, backend: str, fresh: bool) -> Settings:
     if fresh and EVAL_STATE.exists():
         shutil.rmtree(EVAL_STATE)
     EVAL_STATE.mkdir(parents=True, exist_ok=True)
-    mock = str(MOCK_FIXTURES) if backend != "docker" else "/workspace/eval/fixtures/web_mock.json"
     settings = load_settings(
         state_dir=EVAL_STATE,
         cache_path=EVAL_STATE / "cache.db",
@@ -144,8 +144,12 @@ def eval_settings(*, backend: str, fresh: bool) -> Settings:
         audit_log=EVAL_STATE / "audit.jsonl",
         sandbox_backend=backend,
         allow_local_sandbox=(backend == "local"),
-        # Deterministic fixtures: no network egress in any environment.
-        env_allowlist=["ULTRON_WEB_MOCK"],
+        # Deterministic fixtures: no network egress in any environment. This is
+        # a Settings override, not an os.environ write, so it reaches only the
+        # sandbox the eval builds -- the process environment is left alone and
+        # concurrent runs with different fixtures cannot contaminate each other.
+        # The sandbox rewrites the path into the container mount for docker.
+        web_mock=str(MOCK_FIXTURES),
         # LOW + network is escalated to a human by default, and the eval runs
         # unattended, so the research tasks would be refused. The eval is a
         # controlled harness (its tools read a local fixture corpus, never the
@@ -155,8 +159,11 @@ def eval_settings(*, backend: str, fresh: bool) -> Settings:
         # The eval never spends real money: no judge, no synthesis by default.
         enable_llm_judge=os.environ.get("ULTRON_ENABLE_LLM_JUDGE", "0") == "1",
         llm_mode=os.environ.get("ULTRON_LLM_MODE", "auto"),
+        # Live egress stays off here, whatever the environment says: the eval is
+        # a hermetic gate and must never depend on a third party being up.
+        # Live mode is a local/manual feature (see README).
+        eval_live=False,
     )
-    os.environ["ULTRON_WEB_MOCK"] = mock
     return settings
 
 

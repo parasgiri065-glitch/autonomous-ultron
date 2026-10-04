@@ -129,6 +129,22 @@ class Settings(BaseModel):
     allow_local_sandbox: bool = False
     env_allowlist: list[str] = Field(default_factory=list)
     docker_bin: str = "docker"
+    #: Offline fixture corpus for network tools (``ULTRON_WEB_MOCK``). Scoped to
+    #: the Settings instance instead of the process environment: two sandboxes
+    #: with different values must not contaminate each other, and a global
+    #: ``os.environ`` write leaks into every other tool, test and subprocess in
+    #: the process. ``None`` means "no fixtures" (tools may then go live).
+    web_mock: str | None = None
+
+    # --- live egress (opt-in, never used by CI) ----------------------------
+    #: When True, the network tools may reach the real internet, with a
+    #: URL-keyed SQLite cache and the TTLs below. Off by default; the eval
+    #: harness never sets it, so CI stays hermetic.
+    eval_live: bool = False
+    #: URL-keyed page cache used by the tools in live mode. Separate file from
+    #: the harness cache so a ``ultron cache clear`` can never drop it by
+    #: accident, and so the docker backend can mount exactly this directory.
+    web_cache_path: Path = Field(default=REPO_ROOT / ".ultron" / "webcache.db")
 
     # --- policy ------------------------------------------------------------
     policy_network: Literal["auto", "deny"] = "auto"
@@ -167,6 +183,7 @@ class Settings(BaseModel):
             self.memory_path.parent,
             self.audit_log.parent,
             self.approvals_file.parent,
+            self.web_cache_path.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -207,6 +224,12 @@ def load_settings(**overrides: object) -> Settings:
         "allow_local_sandbox": _env_bool("ULTRON_ALLOW_LOCAL_SANDBOX", False),
         "env_allowlist": _env_list("ULTRON_ENV_ALLOWLIST"),
         "docker_bin": _env("ULTRON_DOCKER_BIN", "docker"),
+        # Backward compatible: the env var was the only way to configure this
+        # before, so it keeps working as the *default*; an explicit
+        # ``web_mock=`` override (what the eval does) wins.
+        "web_mock": _env("ULTRON_WEB_MOCK"),
+        "eval_live": _env_bool("ULTRON_EVAL_LIVE", False),
+        "web_cache_path": _resolve(_env("ULTRON_WEB_CACHE"), state_dir / "webcache.db"),
         "policy_network": _env("ULTRON_POLICY_NETWORK", "auto"),
         "policy_network_low_auto": _env_bool("ULTRON_POLICY_NETWORK_LOW_AUTO", False),
         "policy_assume_yes": _env_bool("ULTRON_POLICY_ASSUME_YES", False),

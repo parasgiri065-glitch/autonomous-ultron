@@ -269,6 +269,41 @@ Gates (all configurable, enforced by exit code):
 
 ---
 
+## Live network mode (opt-in, local only)
+
+By default every network tool reads the **fixture corpus** (`web_mock`), so tests, CI and
+the eval gate never touch the internet. Two things change that, both explicit:
+
+| knob | default | what it does |
+| --- | --- | --- |
+| `ULTRON_EVAL_LIVE=1` | `0` | `web_research` / `http_fetch` may reach the real network instead of fixtures |
+| `ULTRON_WEB_CACHE` | `<state_dir>/webcache/webcache.db` | URL-keyed page cache (local backend) |
+| `ULTRON_CACHE_TTL_WEB` | `900` s | page-cache TTL (0 disables the page cache) |
+
+What live mode gives you: a **URL-keyed SQLite cache**, so two different queries that
+touch the same page pay for it once (`select key, hits from cache where ns='web'` — the
+tools write the same schema the harness uses). Precedence is `web_mock` first, then live,
+then plain HTTP, so exporting `ULTRON_EVAL_LIVE=1` can never make an eval run leave the
+fixtures: the eval builds its own `Settings` with `web_mock` set and `eval_live=False`.
+
+What live mode does **not** change: the policy gate. `web_research` declares
+`network:http`, and with the default `policy_network_low_auto=False` a LOW+network tool is
+escalated to a human, so a live run still needs an interactive approval. Live mode is
+*never* enabled by CI.
+
+```bash
+# manual, local, on purpose -- expect an approval prompt
+ULTRON_EVAL_LIVE=1 uv run ultron run "research grid-scale battery storage economics"
+```
+
+Docker note: live mode **adds no mount and does not relax the container**. The repo is
+still the only volume and still `:ro`; the only writable path inside is the noexec tmpfs.
+The URL-keyed page cache is therefore a *local-backend* feature: a docker run over a live
+URL fetches without the page cache (the harness-level envelope cache still applies), so
+nothing about the sandbox's filesystem guarantees changes when you enable egress.
+
+---
+
 ## CI
 
 `.github/workflows/ci.yml`:
@@ -279,6 +314,8 @@ Gates (all configurable, enforced by exit code):
    summary, uploads it as an artifact, and **fails the PR** on any breached gate.
 4. **sandbox-docker** — builds the real image and runs tools through real Docker with
    `--network none` and a read-only filesystem, so the sandbox config can't silently rot.
+   It also runs a 10 MB stdout flooder inside the container to prove the sandbox kills a
+   runaway tool and reports it (`result.ok == False`), since the kill path is Docker-only.
 
 ---
 

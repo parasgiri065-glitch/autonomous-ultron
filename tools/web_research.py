@@ -11,8 +11,11 @@ makes zero HTTP calls.
 Modes
 -----
 * ``ULTRON_WEB_MOCK=/path/mock.json`` -- offline fixture mode (used by tests and
-  by CI, where the sandbox has no network at all).
-* otherwise -- live HTTP via httpx, capped by ``max_sources``/``max_bytes``.
+  by CI, where the sandbox has no network at all). Wins over everything else.
+* ``ULTRON_EVAL_LIVE=1`` -- live HTTP via httpx *with* a URL-keyed SQLite page
+  cache (``ULTRON_WEB_CACHE``) so a page already fetched for another query is
+  never paid for twice. Opt-in, local/manual only; never set by CI.
+* otherwise -- live HTTP via httpx, no page cache (the Phase 1 behaviour).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from html.parser import HTMLParser
 from typing import Any, ClassVar
 from urllib.parse import quote_plus, urlparse
 
+from tools import _webcache
 from tools._io import main_guard, optional, require, text_sentences
 
 SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/?q={query}"
@@ -96,14 +100,32 @@ def _select(docs: list[dict[str, str]], query: str, max_sources: int) -> list[di
     return relevant[:max_sources]
 
 
-def _live_search(query: str, max_sources: int) -> list[dict[str, str]]:
+def _fetch_raw(client: Any, url: str, cache: _webcache.WebCache | None) -> str:
+    """GET ``url`` as text, through the URL-keyed cache when one is active."""
+    if cache is not None:
+        hit = cache.get(url)
+        if hit is not None:
+            return hit
+    resp = client.get(url)
+    resp.raise_for_status()
+    text = resp.text[:MAX_BYTES]
+    if cache is not None:
+        cache.set(url, text)
+    return text
+
+
+def _live_search(
+    query: str,
+    max_sources: int,
+    cache: _webcache.WebCache | None = None,
+) -> list[dict[str, str]]:
     import httpx  # imported lazily so offline mode never touches the network
 
     headers = {"User-Agent": USER_AGENT}
     with httpx.Client(timeout=15.0, follow_redirects=True, headers=headers) as client:
-        resp = client.get(SEARCH_ENDPOINT.format(query=quote_plus(query)))
-        resp.raise_for_status()
-        _, links = html_to_text(resp.text)
+        _, links = html_to_text(
+            _fetch_raw(client, SEARCH_ENDPOINT.format(query=quote_plus(query)), cache)
+        )
         candidates: list[str] = []
         for link in links:
             if "duckduckgo.com" in urlparse(link).netloc:
@@ -115,8 +137,7 @@ def _live_search(query: str, max_sources: int) -> list[dict[str, str]]:
         docs: list[dict[str, str]] = []
         for url in candidates:
             try:
-                page = client.get(url)
-                text, _ = html_to_text(page.text[:MAX_BYTES])
+                text, _ = html_to_text(_fetch_raw(client, url, cache))
             except Exception as exc:
                 docs.append({"url": url, "title": url, "text": f"(unavailable: {exc})"})
                 continue
@@ -167,19 +188,26 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     max_sources = max(1, min(max_sources, MAX_MAX_SOURCES))
 
     mock_path = os.environ.get("ULTRON_WEB_MOCK", "").strip()
+    cache = None
     if mock_path:
         docs = _select(_mock_documents(mock_path), query, max_sources)
         mode = "mock"
     else:
-        docs = _live_search(query, max_sources)
+        # Fixtures win over live mode: an eval run stays hermetic even if the
+        # operator has ULTRON_EVAL_LIVE=1 exported in their shell.
+        cache = _webcache.maybe_cache()
+        docs = _live_search(query, max_sources, cache)
         mode = "live"
 
     summary = summarize(query, docs)
+    meta: dict[str, Any] = {"mode": mode, "documents": len(docs)}
+    if cache is not None:  # live runs only: mock mode adds nothing to report
+        meta["cache"] = cache.stats()
     return {
         "summary": summary,
         "sources": [d.get("url", "") for d in docs],
         "confidence": confidence_for(docs, query, summary),
-        "_meta": {"mode": mode, "documents": len(docs)},
+        "_meta": meta,
     }
 
 
