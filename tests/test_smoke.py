@@ -1375,3 +1375,73 @@ def test_local_backend_reports_a_hung_tool_as_timed_out(settings):
     assert result.error and "timeout" in result.error
     assert elapsed < 10, f"the sandbox must kill the tool, not wait for it ({elapsed:.1f}s)"
     assert result.cacheable is False
+
+
+# ---- the kill must be verified, not just requested (found by the CI docker job)
+def _fake_docker(tmp_path, *, running_forever: bool, inspected: str | None = None):
+    """A stand-in for the docker CLI: records calls, answers `inspect`.
+
+    Lets the kill-verification loop be tested without a daemon -- which is the
+    point: the loop only exists on the docker path.
+    """
+    calls = tmp_path / "calls.log"
+    script = tmp_path / "fake-docker"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"log = pathlib.Path({str(calls)!r})\n"
+        "log.write_text((log.read_text() if log.exists() else '') + ' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1] == 'kill':\n"
+        "    sys.exit(0)\n"
+        f"if {bool(running_forever)}:\n"
+        f"    print({(inspected or 'true')!r}); sys.exit(0)\n"
+        "counter = log.with_suffix('.n')\n"
+        "n = int(counter.read_text()) if counter.exists() else 0\n"
+        "counter.write_text(str(n + 1))\n"
+        "print('true' if n < 2 else 'false')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script, calls
+
+
+def _sandbox_with_docker(tmp_path, binary):
+    configured = load_settings(
+        state_dir=tmp_path,
+        cache_path=tmp_path / "c.db",
+        memory_path=tmp_path / "m.db",
+        approvals_file=tmp_path / "a.json",
+        audit_log=tmp_path / "x.jsonl",
+        docker_bin=str(binary),
+        llm_mode="offline",
+    )
+    return Sandbox(configured, backend="docker")
+
+
+def test_kill_is_retried_until_the_container_stops(tmp_path):
+    binary, calls = _fake_docker(tmp_path, running_forever=False)
+    sandbox = _sandbox_with_docker(tmp_path, binary)
+    assert sandbox._ensure_container_stopped("ultron-x", grace_s=3.0) is True
+    log = calls.read_text()
+    assert "inspect" in log, log
+    assert "kill" in log, "the retry must re-issue the kill while it is still running"
+
+
+def test_kill_reports_failure_when_the_container_never_stops(tmp_path):
+    binary, calls = _fake_docker(tmp_path, running_forever=True)
+    sandbox = _sandbox_with_docker(tmp_path, binary)
+    assert sandbox._ensure_container_stopped("ultron-x", grace_s=0.6) is False
+    assert calls.read_text().count("kill") >= 1
+
+
+def test_a_removed_container_counts_as_stopped(tmp_path):
+    binary, calls = _fake_docker(tmp_path, running_forever=True)
+    script = binary.read_text().replace(
+        "if sys.argv[1] == 'kill':\n    sys.exit(0)",
+        "if sys.argv[1] == 'kill':\n    sys.exit(0)\nif sys.argv[1] == 'inspect':\n    sys.exit(1)  # gone",
+    )
+    binary.write_text(script, encoding="utf-8")
+    sandbox = _sandbox_with_docker(tmp_path, binary)
+    assert sandbox._ensure_container_stopped("ultron-x", grace_s=0.6) is True
+    assert "kill" not in calls.read_text()

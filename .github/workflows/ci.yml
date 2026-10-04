@@ -266,6 +266,10 @@ jobs:
                   capture_output=True, text=True,
               ).stdout.strip()
 
+          # the sandbox verifies its own kill before returning (see
+          # Sandbox._ensure_container_stopped) -- a request that silently failed
+          # would leave a runaway tool alive, which is the whole point of the cap.
+          assert flooded.meta.get("container_stopped") is True, flooded.meta
           running = _containers()
           assert running == "", f"killed container is still running: {running}"
           removed = False

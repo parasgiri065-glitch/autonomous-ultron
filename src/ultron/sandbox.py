@@ -729,6 +729,13 @@ class Sandbox:
         stdout, stderr, code = run.stdout, run.stderr, run.exit_code
         timed_out = run.timed_out
 
+        # The kill was requested from the reader thread; make sure it landed
+        # before returning a result. `container_stopped` is reported either way,
+        # so a leak would be visible in the envelope rather than inferred.
+        container_stopped: bool | None = None
+        if run.capped or timed_out:
+            container_stopped = self._ensure_container_stopped(container)
+
         envelope, parse_error = parse_envelope(stdout)
         ok = (
             bool(envelope and envelope.get("ok")) and code == 0 and not timed_out and not run.capped
@@ -770,18 +777,66 @@ class Sandbox:
             image_digest=image_digest,
             run_id=self.run_id,
             container=container,
-            meta={"tool_meta": (envelope or {}).get("meta", {}), **run.as_meta()},
+            meta={
+                "tool_meta": (envelope or {}).get("meta", {}),
+                **run.as_meta(),
+                "container_stopped": container_stopped,
+            },
         )
 
-    def _kill(self, container: str) -> None:
-        # Best effort: the container is already gone if the daemon is unreachable.
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(
+    def _kill(self, container: str) -> bool:
+        """``docker kill`` one container; report whether the command succeeded.
+
+        Deliberately not fire-and-forget: a kill that silently fails leaves a
+        runaway tool running, which is the failure mode bounded output exists to
+        prevent. The caller decides what to do about a ``False``.
+        """
+        try:
+            proc = subprocess.run(
                 [self.settings.docker_bin, "kill", container],
                 capture_output=True,
                 text=True,
                 timeout=15,
             )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        # A container that is already gone is a success from our point of view.
+        return proc.returncode == 0 or "No such container" in (proc.stderr or "")
+
+    def _ensure_container_stopped(self, container: str, *, grace_s: float = 8.0) -> bool:
+        """Verify a requested kill took effect, retrying until the deadline.
+
+        ``docker kill`` is asynchronous from the host's point of view: it returns
+        as soon as the daemon accepts the signal, and the daemon may still report
+        the container as running for a while after that (observed in CI: the
+        flooder blocked writing into a pipe we had stopped reading, and the first
+        kill did not stop it). A sandbox that *requests* a kill and does not check
+        leaks the very process the cap was meant to stop, so this confirms the
+        state, retries, and returns False if the container refuses to die.
+        """
+        deadline = time.time() + grace_s
+        while True:
+            try:
+                proc = subprocess.run(
+                    [
+                        self.settings.docker_bin,
+                        "inspect",
+                        "--format",
+                        "{{.State.Running}}",
+                        container,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            if proc.returncode != 0 or proc.stdout.strip() == "false":
+                return True  # removed by --rm, or stopped: both are "not running"
+            if time.time() >= deadline:
+                return False
+            self._kill(container)
+            time.sleep(0.5)
 
     def _image_digest(self) -> str:
         try:
