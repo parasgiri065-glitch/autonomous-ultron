@@ -425,6 +425,17 @@ class Registry:
         data["source_path"] = str(path)
         return ToolManifest(**data)
 
+    def register(self, manifest: ToolManifest | Path) -> ToolManifest:
+        """Register one validated manifest without rescanning unrelated tools."""
+        item = self.load_manifest(manifest) if isinstance(manifest, Path) else manifest
+        bucket = self._by_name.setdefault(item.name, {})
+        existing = bucket.get(item.version)
+        if existing is not None and existing.content_hash != item.content_hash:
+            raise ManifestError(f"duplicate manifest {item.key}")
+        bucket[item.version] = item
+        self._index = None
+        return item
+
     # ------------------------------------------------------------------ queries
     def get(self, name: str, version: str | None = None) -> ToolManifest:
         if "@" in name and version is None:
