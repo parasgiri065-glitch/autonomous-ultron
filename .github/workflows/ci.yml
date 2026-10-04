@@ -1,0 +1,238 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Offline, deterministic CI: no provider keys, no hidden spend, no network egress
+  # from tools (they read eval/fixtures instead of the web).
+  ULTRON_LLM_MODE: offline
+  ULTRON_SANDBOX: local
+  ULTRON_ALLOW_LOCAL_SANDBOX: "1"
+  ULTRON_ENABLE_LLM_JUDGE: "0"
+  ULTRON_ENABLE_SYNTHESIS: "0"
+  # Price the stub calls with the real model table so the cost gate cannot pass
+  # vacuously. Reports are labelled cost_basis="simulated".
+  ULTRON_COST_SIMULATE: "1"
+  # Cost/quality gates. A PR fails if any of these are breached.
+  ULTRON_EVAL_MIN_SUCCESS_RATE: "0.80"
+  ULTRON_EVAL_MAX_AVG_COST_USD: "0.02"
+  ULTRON_EVAL_MAX_AVG_LATENCY_S: "20"
+
+jobs:
+  lint:
+    name: lint + type sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --group dev
+      - name: ruff
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: import the harness (import-time sanity, no network)
+        run: uv run python -c "import ultron, ultron.agent; print('ultron', ultron.__version__)"
+      - name: every manifest validates against tools/schema.json
+        run: uv run python -m ultron.main tools validate
+
+  test:
+    name: pytest (offline, no docker)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --group dev
+      - name: pytest
+        run: uv run pytest -q --maxfail=1
+      - name: smoke the CLI
+        run: |
+          uv run python -m ultron.main doctor || true
+          uv run python -m ultron.main tools list
+          uv run python -m ultron.main run "calculate 12*(3+4)" --backend local || true
+
+  eval-gate:
+    name: eval gate (success rate / cost / latency)
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    env:
+      # Stub mode runs every LLM call site (router escalation, judge, synthesis)
+      # with deterministic canned answers priced from the real price table, so
+      # the cost gate measures the real accounting path instead of a constant 0.
+      ULTRON_LLM_MODE: stub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --group dev
+      - name: full eval (cold + warm cache passes + recall pass)
+        run: uv run python eval/run.py --passes 3 --backend local --json > eval/report.json
+      - name: print summary
+        if: always()
+        run: |
+          uv run python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("eval/report.json"))
+          m = r["metrics"]
+          print("## Ultron eval report\n")
+          print(f"- tasks: **{m['tasks']}**  (backend `{r['backend']}`, basis `{r['cost_basis']}`)")
+          print(f"- success rate: **{m['success_rate']:.1%}**")
+          print(f"- avg cost/run: **${m['avg_cost_usd']:.6f}**")
+          print(f"- avg latency: **{m['avg_latency_s']:.2f}s**")
+          print(f"- cache hit rate (warm): **{m['cache_hit_rate']:.1%}**")
+          print(f"- memory recall rate: **{m['memory_recall_rate']:.1%}**")
+          print(f"- policy gate rate: **{m['policy_gate_rate']:.1%}**\n")
+          print("| gate | verdict | detail |")
+          print("| --- | --- | --- |")
+          for g in r["gates"]:
+              print(f"| {g['name']} | {'PASS' if g['ok'] else 'FAIL'} | {g['detail']} |")
+          print("\n| task | status | tools | policy | cost | latency | verdict |")
+          print("| --- | --- | --- | --- | --- | --- | --- |")
+          for o in r["outcomes"]:
+              verdict = "pass" if o["ok"] else "fail: " + "; ".join(o["failures"])[:80]
+              print(f"| {o['id']} | {o['status']} | {','.join(o['tools_used']) or '-'} | "
+                    f"{','.join(o['policy_actions']) or '-'} | ${o['cost_usd']:.6f} | "
+                    f"{o['latency_s']:.2f}s | {verdict} |")
+          PY
+      - name: enforce gates (fails the PR on regression)
+        run: |
+          uv run python - <<'PY'
+          import json, sys
+          r = json.load(open("eval/report.json"))
+          failures = [g for g in r["gates"] if not g["ok"]]
+          for f in failures:
+              print(f"::error title=eval gate failed::{f['name']}: {f['detail']}")
+          sys.exit(1 if failures else 0)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: |
+            eval/report.json
+            eval/last_report.md
+          retention-days: 14
+
+  sandbox-docker:
+    name: real docker sandbox (network=none, read-only fs)
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --group dev
+      - name: build the tool image
+        run: docker build -t ultron-tools:phase1 -f docker/Dockerfile .
+      - name: run a tool through the real sandbox (no network, read-only root)
+        env:
+          ULTRON_SANDBOX: docker
+          ULTRON_ALLOW_LOCAL_SANDBOX: "0"
+          ULTRON_SANDBOX_IMAGE: ultron-tools:phase1
+          # Hermetic: the container reads the fixture corpus from the read-only
+          # repo mount instead of the live web, so this job cannot flake on an
+          # external site refusing a CI runner's IP. Real egress is proven by the
+          # network-mode assertions below, not by reaching a third party.
+          ULTRON_WEB_MOCK: /workspace/eval/fixtures/web_mock.json
+          ULTRON_ENV_ALLOWLIST: ULTRON_WEB_MOCK
+          # This job has no human to ask, and LOW+network is now escalated to a
+          # human by default. Opt in explicitly so the docker egress path stays
+          # exercised -- and assert below that the *default* still escalates.
+          ULTRON_POLICY_NETWORK_LOW_AUTO: "1"
+        run: |
+          uv run python - <<'PY'
+          import json
+          from ultron.config import load_settings
+          from ultron.policy import PolicyGate, PolicyRequest
+          from ultron.registry import Registry, RiskTier
+          from ultron.sandbox import Sandbox
+
+          settings = load_settings()
+          registry = Registry(settings).load(strict=True)
+          sandbox = Sandbox(settings, backend="docker")
+          gate = PolicyGate(settings)
+
+          for name, inputs, expected_net, expected_mode in (
+              ("calc", {"expression": "12*(3+4)"}, "none", "none"),
+              ("web_research", {"query": "fluoridation", "max_sources": 2}, "http", "bridge"),
+          ):
+              manifest = registry.get(name)
+              decision = gate.check(PolicyRequest(tool=manifest, inputs=inputs, goal="ci"))
+              assert decision.action == "allow", decision.reason
+              # the semantic grant must match the manifest's declaration...
+              assert decision.network == expected_net, (decision.network, expected_net)
+              # ...and docker must get a network MODE, not the permission detail
+              argv = sandbox.docker_command_preview(manifest, decision)
+              assert f"--network={expected_mode}" in argv, argv
+              result = sandbox.run(manifest, inputs, decision, use_cache=False)
+              assert result.ok, f"{name} failed: {result.error}\n{result.stderr[-800:]}"
+              assert result.docker_network == expected_mode, result.docker_network
+              print(f"{name} -> net={result.network}/docker:{result.docker_network} "
+                    f"{json.dumps(result.result)[:140]}")
+
+          # default posture: a LOW-risk tool that wants network is escalated to a
+          # human, and an unattended run must refuse rather than self-approve
+          from ultron.errors import HumanApprovalRequired
+          from ultron.policy import DenyAllPrompter
+
+          strict = load_settings(policy_network_low_auto=False)
+          strict_gate = PolicyGate(strict, prompter=DenyAllPrompter())
+          escalated = strict_gate.check(PolicyRequest(
+              tool=registry.get("web_research"), inputs={"query": "x", "max_sources": 1}))
+          assert escalated.action == "ask" and escalated.escalated, escalated.reason
+          try:
+              strict_gate.evaluate(PolicyRequest(
+                  tool=registry.get("web_research"), inputs={"query": "x", "max_sources": 1}),
+                  interactive=False)
+              raise AssertionError("unattended LOW+network run must not be allowed")
+          except HumanApprovalRequired:
+              pass
+          print("default posture verified: low risk + network -> ask (escalated), never auto-run")
+
+          # approval replay: one stored approval authorises exactly one run
+          from ultron.policy import ApprovalStore
+
+          temp = load_settings(state_dir="/tmp/ultron-ci-pol", approvals_file="/tmp/ultron-ci-pol/a.json",
+                               cache_path="/tmp/ultron-ci-pol/c.db", memory_path="/tmp/ultron-ci-pol/m.db",
+                               audit_log="/tmp/ultron-ci-pol/x.jsonl")
+          store = ApprovalStore(temp.approvals_file)
+          calc_medi = registry.get("calc").model_copy(update={"risk": RiskTier.MEDIUM})
+          req = PolicyRequest(tool=calc_medi, inputs={"expression": "6*7"})
+          store.grant(req, approver="ci", max_uses=1)
+          assert PolicyGate(temp, store=store).check(req).allowed
+          assert not PolicyGate(temp, store=store).check(req).allowed
+          print("approval replay verified: second check() is refused")
+
+          # hardening flags are applied to every container, not just documented
+          calc = registry.get("calc")
+          preview = " ".join(
+              sandbox.docker_command_preview(
+                  calc, gate.check(PolicyRequest(tool=calc, inputs={"expression": "1+1"}))
+              )
+          )
+          for flag in ("--read-only", "--cap-drop ALL", "no-new-privileges", "--user", "65534",
+                       "--pids-limit", "--memory", "--tmpfs", "/workspace:ro"):
+              assert flag in preview, f"missing hardening flag: {flag}"
+          print("container hardening flags verified")
+          # a tool that is denied never reaches docker at all
+          denied = gate.check(PolicyRequest(tool=registry.get("http_fetch"),
+                                            inputs={"url": "https://example.com", "max_bytes": 100}))
+          assert denied.action == "ask", denied.reason
+          print("policy gate verified: medium risk = ask, not auto-run")
+          PY

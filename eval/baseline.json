@@ -1,0 +1,41 @@
+{
+  "updated_at": "2026-10-03T21:05:54Z",
+  "tasks": 7,
+  "success_rate": 1.0,
+  "avg_cost_usd": 4.52e-06,
+  "avg_latency_s": 0.0298,
+  "cache_hit_rate": 1.0,
+  "cost_basis": "simulated",
+  "by_category": {
+    "ambiguous": {
+      "tasks": 1,
+      "success_rate": 1.0,
+      "avg_cost_usd": 3.165e-05,
+      "avg_latency_s": 0.0051
+    },
+    "deterministic": {
+      "tasks": 2,
+      "success_rate": 1.0,
+      "avg_cost_usd": 0.0,
+      "avg_latency_s": 0.0423
+    },
+    "direct": {
+      "tasks": 1,
+      "success_rate": 1.0,
+      "avg_cost_usd": 0.0,
+      "avg_latency_s": 0.0035
+    },
+    "policy": {
+      "tasks": 1,
+      "success_rate": 1.0,
+      "avg_cost_usd": 0.0,
+      "avg_latency_s": 0.0046
+    },
+    "research": {
+      "tasks": 2,
+      "success_rate": 1.0,
+      "avg_cost_usd": 0.0,
+      "avg_latency_s": 0.0554
+    }
+  }
+}

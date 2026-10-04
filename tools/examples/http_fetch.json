@@ -1,0 +1,15 @@
+{
+  "name": "http_fetch",
+  "version": "0.1.0",
+  "entrypoint": "python -m tools.http_fetch",
+  "permissions": ["network:http"],
+  "risk": "medium",
+  "description": "Fetch a single URL over http(s) and return status, headers and a text excerpt. Requests network egress, so the policy gate asks a human before it runs.",
+  "inputs": {"url": "string", "max_bytes": "int"},
+  "outputs": {"status": "int", "url": "string", "text": "string", "truncated": "bool"},
+  "tags": ["http", "web", "fetch", "network"],
+  "deterministic": true,
+  "timeout_s": 20,
+  "cache_ttl_s": 900,
+  "price_estimate_usd": 0.0
+}
