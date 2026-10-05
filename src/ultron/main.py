@@ -23,6 +23,7 @@ from . import __version__
 from .agent import Agent
 from .cache import Cache
 from .config import get_settings
+from .domains.intel import IntelError, IntelResearchEngine
 from .errors import HumanApprovalRequired, PolicyDenied, SandboxUnavailable, UltronError
 from .forge import ForgeEngine
 from .harvester import HarvestError, PyPIHarvester
@@ -583,6 +584,42 @@ def cmd_repair(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_intel(args: argparse.Namespace) -> int:
+    try:
+        settings = get_settings()
+        output = Path(args.output).expanduser() if args.output else None
+        brief = IntelResearchEngine(settings).research(args.topic, depth=args.depth, output=output)
+        payload = {
+            "topic": brief.topic,
+            "depth": args.depth,
+            "sources": len(brief.sources),
+            "verified_claims": len(brief.verified_facts),
+            "markdown": str(brief.markdown_path) if brief.markdown_path else None,
+            "json": str(brief.json_path) if brief.json_path else None,
+            "report": brief.markdown,
+        }
+    except (IntelError, OSError) as exc:
+        if args.json:
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            _console().print(f"[red]intel failed[/red]: {exc}")
+        return 1
+    if args.json:
+        _print_json({"ok": True, **payload})
+    else:
+        from rich.table import Table
+
+        table = Table(title="Autonomous intelligence brief", header_style="bold")
+        table.add_column("field")
+        table.add_column("value")
+        for key in ("topic", "depth", "sources", "verified_claims", "markdown", "json"):
+            value = payload[key]
+            table.add_row(key, "-" if value is None else str(value))
+        _console().print(table)
+        _console().print(brief.markdown)
+    return 0
+
+
 def cmd_telegram(args: argparse.Namespace) -> int:
     settings = get_settings()
     if not settings.telegram_bot_token:
@@ -741,6 +778,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair = add_sub("repair", help="inspect self-repair tickets")
     p_repair.add_argument("--list", action="store_true", help="show open repair tickets")
     p_repair.set_defaults(func=cmd_repair)
+
+    p_intel = add_sub("intel", help="research a topic from public unauthenticated sources")
+    p_intel.add_argument("topic")
+    p_intel.add_argument("--depth", choices=["light", "deep"], default="light")
+    p_intel.add_argument(
+        "--output", default=None, help="path for the Markdown brief (JSON is adjacent)"
+    )
+    p_intel.set_defaults(func=cmd_intel)
 
     p_telegram = add_sub("telegram", help="start the Telegram cockpit")
     p_telegram.add_argument("--timeout", type=int, default=20, help="long-poll timeout seconds")
