@@ -22,11 +22,14 @@ from ..agent import Agent, AgentResult
 from ..cache import Cache
 from ..config import Settings, get_settings
 from ..domains.intel import IntelResearchEngine
+from ..engine.runtime import RuntimeEngine
 from ..extractor import ExtractionError, GroundedDataExtractor
 from ..ledger import FailureLedger
 from ..policy import ApprovalPrompt, PolicyGate, Prompter
 from ..registry import Registry
 from ..scavenger import Scavenger
+from ..soul.identity import SoulIdentity
+from ..soul.memory import MemoryEngine
 
 LOG = logging.getLogger(__name__)
 
@@ -440,11 +443,25 @@ class TelegramCockpit:
     def handle_goal(self, goal: str, chat_id: int | str) -> AgentResult:
         self.client.send_message(chat_id, "Planning…")
         agent = self._make_agent(chat_id)
-        result = agent.run(goal)
-        for step in result.steps:
+        if self._agent_factory is None:
+            self.client.send_message(
+                chat_id, "Meta-loop: decomposing goal and checking capabilities…"
+            )
+            runtime = RuntimeEngine(
+                self.settings,
+                registry=agent.registry,
+                identity=SoulIdentity(self.settings),
+                memory=MemoryEngine(self.settings.state_dir / "soul_memory.db"),
+                agent=agent,
+            )
+            meta_result = runtime.run(goal)
+            result = meta_result.legacy_result or meta_result
+        else:
+            result = agent.run(goal)
+        for step in getattr(result, "steps", []) or []:
             self.client.send_message(chat_id, f"Running tool: {step.tool}…")
             self.client.send_message(chat_id, "Verifying with Breaker…")
-        final_text = result.answer or "No grounded response was produced."
+        final_text = getattr(result, "answer", "") or "No grounded response was produced."
         self.client.send_message(chat_id, final_text)
         for artifact in self._artifacts(result):
             self.client.send_document(chat_id, artifact)
@@ -496,8 +513,10 @@ class TelegramCockpit:
                 except OSError:
                     return
 
-        for step in result.steps:
+        for step in getattr(result, "steps", []) or []:
             visit(step.result)
+        for node in getattr(result, "nodes", []) or []:
+            visit(getattr(node, "result", None))
         return found
 
 

@@ -24,6 +24,7 @@ from .agent import Agent
 from .cache import Cache
 from .config import get_settings
 from .domains.intel import IntelError, IntelResearchEngine
+from .engine.runtime import RuntimeEngine
 from .errors import HumanApprovalRequired, PolicyDenied, SandboxUnavailable, UltronError
 from .extractor import ExtractionError, GroundedDataExtractor
 from .forge import ForgeEngine
@@ -38,6 +39,8 @@ from .registry import Registry
 from .repair import RepairEngine, RepairError
 from .sandbox import Sandbox
 from .scavenger import Scavenger
+from .soul.identity import SoulIdentity
+from .soul.memory import MemoryEngine
 
 
 def _console():
@@ -190,7 +193,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     try:
-        result = agent.run(args.goal, max_steps=args.max_steps)
+        soul_identity = SoulIdentity(settings)
+        soul_memory = MemoryEngine(settings.state_dir / "soul_memory.db")
+        runtime = RuntimeEngine(
+            settings,
+            registry=agent.registry,
+            identity=soul_identity,
+            memory=soul_memory,
+            agent=agent,
+        )
+        meta_result = runtime.run(args.goal, {"persona": "loyal, sharp, zero-sycophancy"})
+        result = meta_result.legacy_result or meta_result
     except (PolicyDenied, HumanApprovalRequired) as exc:
         _print_json({"status": "denied", "error": str(exc)})
         return 2
@@ -206,8 +219,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.json:
         _print_json(result.as_dict())
-    else:
+    elif hasattr(result, "budget"):
         _render_run(result)
+    else:
+        _console().print_json(json.dumps(result.as_dict(), default=str))
     return 0 if result.ok else 1
 
 
@@ -245,6 +260,50 @@ def _render_run(result: Any) -> None:
     )
     for note in result.notes:
         console.print(f"  [dim]· {note}[/dim]")
+
+
+def cmd_soul(args: argparse.Namespace) -> int:
+    """Inspect or manage the persistent identity and soul memory graph."""
+    settings = get_settings()
+    identity = SoulIdentity(settings)
+    memory = MemoryEngine(settings.state_dir / "soul_memory.db")
+    if args.action == "show":
+        payload = {"identity": identity.inspect(), "memory": memory.stats()}
+    elif args.action == "set":
+        updates: dict[str, Any] = {}
+        identity_values = {
+            key: value
+            for key, value in {
+                "user": args.user,
+                "name": args.name,
+                "mission": args.mission,
+            }.items()
+            if value is not None
+        }
+        if identity_values:
+            updates["identity"] = identity_values
+        if args.key is not None:
+            if args.value is None:
+                raise UltronError("soul set --key requires --value")
+            preferences = dict(identity.profile.get("preferences") or {})
+            preferences[args.key] = args.value
+            updates["preferences"] = preferences
+        if not updates:
+            raise UltronError("soul set requires --user, --name, --mission, or --key/--value")
+        payload = {"identity": identity.update(updates), "memory": memory.stats()}
+    elif args.action == "stats":
+        payload = memory.stats()
+    elif args.action == "reflect":
+        payload = memory.reflect(args.query, limit=args.limit)
+    elif args.action == "forget":
+        payload = {"deleted": memory.forget(episode_id=args.episode), "memory": memory.stats()}
+    else:  # pragma: no cover - argparse constrains this
+        raise UltronError(f"unknown soul action: {args.action}")
+    if args.json:
+        _print_json(payload)
+    else:
+        _console().print_json(json.dumps(payload, default=str))
+    return 0
 
 
 def cmd_tools(args: argparse.Namespace) -> int:
@@ -766,6 +825,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive", action="store_true", help="allow the live-network approval prompt"
     )
     p_extract.set_defaults(func=cmd_extract)
+
+    p_soul = add_sub("soul", help="inspect and manage identity and semantic memory")
+    p_soul.add_argument(
+        "action", choices=["show", "set", "stats", "reflect", "forget"], default="show", nargs="?"
+    )
+    p_soul.add_argument("--user", default=None)
+    p_soul.add_argument("--name", default=None)
+    p_soul.add_argument("--mission", default=None)
+    p_soul.add_argument("--key", default=None, help="preference key for `soul set`")
+    p_soul.add_argument("--value", default=None, help="preference value for `soul set`")
+    p_soul.add_argument("--query", default=None, help="semantic reflection query")
+    p_soul.add_argument("--limit", type=int, default=20)
+    p_soul.add_argument("--episode", default=None, help="episode id for `soul forget`")
+    p_soul.set_defaults(func=cmd_soul)
 
     p_run = add_sub("run", help="run one goal through the agent loop")
     p_run.add_argument("goal")

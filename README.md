@@ -242,6 +242,24 @@ ultron extract-eval [--json]        # offline Phase 4.2 fixture accuracy
 
 `--json` on every subcommand; `python -m ultron.main ...` works without installation.
 
+### Phase 5 universal engine and soul
+
+The universal runtime decomposes explicit or heuristic goal plans into a typed
+execution DAG, checks the registry capability graph, and marks missing capabilities
+for bounded JIT synthesis. Discovery, refinery, Forge sandbox tests, Breaker checks,
+dynamic registration, and up to three repair attempts are injectable and remain
+offline by default. Successful trajectories may be consolidated into the SQLite soul
+memory graph for zero-cost exact recall. The profile at
+`<state_dir>/soul_profile.json` is operator-controlled grounding context, not a policy
+or secret store.
+
+```bash
+uv run ultron run "<any goal>" --json
+uv run ultron soul show --json
+uv run ultron soul set --user Ada --key format --value concise
+uv run ultron soul reflect --query "verified report" --json
+```
+
 ### Grounded single-page extraction
 
 `ultron extract` accepts one local HTML, CSV, JSON, text, or PDF file, or one public
