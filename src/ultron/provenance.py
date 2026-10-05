@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from .cache import make_key
 
-Origin = Literal["user", "sandbox_tool", "cache", "web_fetch", "llm_generated"]
+Origin = Literal["user", "sandbox_tool", "cache", "web_fetch", "local_file", "llm_generated"]
 
 
 @dataclass(slots=True)
@@ -64,7 +64,7 @@ class ProvenanceEnvelope:
         payload: Any,
         *,
         verified: bool = False,
-        origin: Literal["sandbox_tool", "web_fetch"] = "sandbox_tool",
+        origin: Literal["sandbox_tool", "web_fetch", "local_file"] = "sandbox_tool",
         metadata: dict[str, Any] | None = None,
     ) -> ProvenanceEnvelope:
         """Tag output with both the manifest key and its content hash."""
@@ -111,7 +111,14 @@ class ProvenanceEnvelope:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ProvenanceEnvelope:
         origin = value.get("origin")
-        if origin not in {"user", "sandbox_tool", "cache", "web_fetch", "llm_generated"}:
+        if origin not in {
+            "user",
+            "sandbox_tool",
+            "cache",
+            "web_fetch",
+            "local_file",
+            "llm_generated",
+        }:
             raise ValueError(f"unknown provenance origin: {origin!r}")
         return cls(
             origin=origin,

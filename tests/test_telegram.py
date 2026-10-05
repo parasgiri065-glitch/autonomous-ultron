@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ultron.agent import AgentResult, Budget
 from ultron.config import REPO_ROOT, load_settings
+from ultron.extractor import GroundedDataExtractor
 from ultron.interfaces.telegram import TelegramBotClient, TelegramCockpit, TelegramPrompter
 from ultron.ledger import FailureLedger
 from ultron.policy import ApprovalPrompt
@@ -73,6 +74,42 @@ def test_text_message_runs_agent_and_sends_status_and_final(tmp_path):
     )
     assert isinstance(result, AgentResult)
     assert sent == ["Planning…", "grounded answer"]
+
+
+def test_telegram_extract_delivers_supported_artifact(tmp_path):
+    sent_messages: list[str] = []
+    sent_documents: list[str] = []
+
+    def transport(method, _url, kwargs):
+        if method == "sendMessage":
+            sent_messages.append(kwargs["json"]["text"])
+        elif method == "sendDocument":
+            sent_documents.append(kwargs["files"]["document"][0])
+        return {"ok": True, "result": {}}
+
+    settings = _settings(tmp_path)
+    client = TelegramBotClient("token", [42], transport=transport, settings=settings)
+    cockpit = TelegramCockpit(
+        client,
+        settings=settings,
+        extractor_factory=lambda _chat: GroundedDataExtractor(settings),
+    )
+    result = cockpit.handle_update(
+        {
+            "update_id": 12,
+            "message": {
+                "from": {"id": 42},
+                "chat": {"id": 42},
+                "text": '/extract tests/fixtures/extract_profile.json --fields \'{"name":"string"}\' --format csv',
+            },
+        }
+    )
+    assert result["command"] == "/extract"
+    assert result["result"]["data"] == {"name": "Ada Lovelace"}
+    assert any("Ada Lovelace" in message for message in sent_messages)
+    assert len(sent_documents) == 1
+    assert sent_documents[0].startswith("extract-")
+    assert sent_documents[0].endswith(".csv")
 
 
 def test_telegram_prompter_sends_keyboard_and_accepts_callback(tmp_path):

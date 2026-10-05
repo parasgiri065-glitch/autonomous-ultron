@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -21,6 +22,7 @@ from ..agent import Agent, AgentResult
 from ..cache import Cache
 from ..config import Settings, get_settings
 from ..domains.intel import IntelResearchEngine
+from ..extractor import ExtractionError, GroundedDataExtractor
 from ..ledger import FailureLedger
 from ..policy import ApprovalPrompt, PolicyGate, Prompter
 from ..registry import Registry
@@ -255,6 +257,7 @@ class TelegramCockpit:
         settings: Settings | None = None,
         agent_factory: Callable[[int | str], Agent] | None = None,
         intel_factory: Callable[[], IntelResearchEngine] | None = None,
+        extractor_factory: Callable[[int | str], GroundedDataExtractor] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.client = client
@@ -263,6 +266,7 @@ class TelegramCockpit:
         self.cache = Cache(self.settings)
         self._agent_factory = agent_factory
         self._intel_factory = intel_factory
+        self._extractor_factory = extractor_factory
 
     def handle_update(self, update: dict[str, Any]) -> AgentResult | dict[str, Any] | None:
         if not self.client.authorized_update(update):
@@ -282,6 +286,8 @@ class TelegramCockpit:
             if command == "/intel":
                 topic = parts[1].strip() if len(parts) == 2 else ""
                 return self.handle_intel(topic, chat_id)
+            if command == "/extract":
+                return self.handle_extract(parts[1] if len(parts) == 2 else "", chat_id)
             return self.handle_command(command, chat_id)
         return self.handle_goal(text, chat_id)
 
@@ -292,7 +298,7 @@ class TelegramCockpit:
                 "text": (
                     "*Ultron cockpit*\n\n"
                     f"*Status:* online · {len(self.registry)} active tool(s)\n"
-                    "Send a goal to run the agent. Commands: `/intel <topic>`, `/gaps`, `/scavenge`, `/status`."
+                    "Send a goal to run the agent. Commands: `/intel <topic>`, `/extract <URL-or-path> --fields '<JSON>' --format json|csv|md`, `/gaps`, `/scavenge`, `/status`."
                 ),
             }
         elif command == "/intel":
@@ -337,6 +343,70 @@ class TelegramCockpit:
             payload = {"command": command, "text": "Unknown command. Try `/help`."}
         self.client.send_message(chat_id, payload["text"])
         return payload
+
+    def handle_extract(self, arguments: str, chat_id: int | str) -> dict[str, Any]:
+        """Run one explicitly-schema'd extraction and deliver its artifact."""
+        try:
+            tokens = shlex.split(arguments)
+            if not tokens:
+                raise ExtractionError(
+                    'usage: /extract <URL-or-path> --fields \'{"name":"string"}\' --format json|csv|md'
+                )
+            source = tokens[0]
+            fields_arg: str | None = None
+            output_format = "json"
+            index = 1
+            while index < len(tokens):
+                token = tokens[index]
+                if token in {"--fields", "-f"}:
+                    index += 1
+                    if index >= len(tokens):
+                        raise ExtractionError("--fields requires a JSON object")
+                    fields_arg = tokens[index]
+                elif token.startswith("--fields="):
+                    fields_arg = token.split("=", 1)[1]
+                elif token == "--format":
+                    index += 1
+                    if index >= len(tokens):
+                        raise ExtractionError("--format requires json, csv, or md")
+                    output_format = tokens[index]
+                elif token.startswith("--format="):
+                    output_format = token.split("=", 1)[1]
+                else:
+                    raise ExtractionError(f"unknown /extract option: {token}")
+                index += 1
+            if fields_arg is None:
+                raise ExtractionError("--fields is required")
+            fields = json.loads(fields_arg)
+            extractor = (
+                self._extractor_factory(chat_id)
+                if self._extractor_factory is not None
+                else GroundedDataExtractor(
+                    self.settings,
+                    policy_gate=PolicyGate(
+                        self.settings,
+                        prompter=TelegramPrompter(self.client, chat_id),
+                        run_id=f"telegram-extract-{chat_id}",
+                    ),
+                    interactive=True,
+                )
+            )
+            result = extractor.extract(source, fields, output_format=output_format)
+            rendered = result.render(output_format)
+            self.client.send_message(chat_id, rendered[:3800])
+            if result.ok:
+                artifact = result.write_artifact(
+                    self.settings.state_dir
+                    / "extract"
+                    / f"extract-{int(time.time())}.{output_format}",
+                    output_format,
+                )
+                self.client.send_document(chat_id, artifact, caption="Grounded extraction artifact")
+            return {"command": "/extract", "source": source, "result": result.as_dict()}
+        except (ExtractionError, json.JSONDecodeError, ValueError) as exc:
+            payload = {"command": "/extract", "error": str(exc)}
+            self.client.send_message(chat_id, f"Extraction refused: {exc}")
+            return payload
 
     def handle_intel(self, topic: str, chat_id: int | str) -> dict[str, Any]:
         if not topic.strip():

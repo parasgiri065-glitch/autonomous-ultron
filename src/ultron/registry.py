@@ -124,6 +124,7 @@ TYPE_MAP: dict[str, type | tuple[type, ...]] = {
     "list[string]": list,
     "list[float]": list,
     "list[int]": list,
+    "list[bool]": list,
     "dict": dict,
     "any": object,
 }
