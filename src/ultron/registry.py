@@ -197,6 +197,8 @@ class ToolManifest(BaseModel):
     #: Rough expected spend per call (USD). 0.0 for deterministic tools.
     price_estimate_usd: float = 0.0
     author: str = "ultron"
+    #: Attested host-side dependencies and forge provenance.
+    meta: dict[str, Any] = Field(default_factory=dict)
     source_path: str = ""
 
     # --------------------------------------------------------------- validation

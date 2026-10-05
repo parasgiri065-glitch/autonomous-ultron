@@ -25,6 +25,7 @@ step costs zero CPU, zero network and zero dollars.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import shlex
@@ -424,6 +425,49 @@ def parse_envelope(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
     return None, "no valid envelope found on stdout (expected a JSON object with an 'ok' field)"
 
 
+def _wheel_dependencies(manifest: ToolManifest, settings: Settings) -> list[dict[str, str]]:
+    """Validate sealed wheel attestations and return safe read-only mounts."""
+    dependencies = manifest.meta.get("dependencies", {}) if manifest.meta else {}
+    raw_items = dependencies.get("wheels", []) if isinstance(dependencies, dict) else []
+    if not isinstance(raw_items, list):
+        raise SandboxError(f"{manifest.key}: wheel dependencies must be a list")
+    wheel_root = (Path(settings.state_dir) / "wheels").resolve()
+    validated: list[dict[str, str]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise SandboxError(f"{manifest.key}: malformed wheel dependency")
+        package = str(raw.get("package") or "").strip()
+        filename = Path(str(raw.get("filename") or "")).name
+        path = Path(str(raw.get("path") or wheel_root / filename)).resolve()
+        expected = str(raw.get("sha256") or "").lower()
+        if not package or not filename.endswith((".whl", ".tar.gz", ".zip")) or not expected:
+            raise SandboxError(
+                f"{manifest.key}: wheel dependency lacks package, filename, or sha256"
+            )
+        try:
+            path.relative_to(wheel_root)
+        except ValueError as exc:
+            raise SandboxError(
+                f"{manifest.key}: wheel path escapes sealed wheel directory"
+            ) from exc
+        if not path.is_file():
+            raise SandboxError(f"{manifest.key}: wheel is missing: {path}")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            raise SandboxError(
+                f"{manifest.key}: wheel sha256 mismatch for {filename}: expected {expected}, got {digest}"
+            )
+        validated.append(
+            {
+                "package": package,
+                "version": str(raw.get("version") or ""),
+                "filename": filename,
+                "path": str(path),
+            }
+        )
+    return validated
+
+
 class Sandbox:
     """Executes a validated, policy-approved tool invocation."""
 
@@ -761,6 +805,27 @@ class Sandbox:
         # filesystem footprint at all -- it only permits egress.
         for name, value in sorted(allowed.items()):
             args += ["-e", f"{name}={value}"]
+        wheel_items = _wheel_dependencies(manifest, self.settings)
+        for item in wheel_items:
+            args += [
+                "-v",
+                f"{item['path']}:/wheels/{item['filename']}:ro",
+            ]
+        if wheel_items:
+            packages = [
+                f"{item['package']}=={item['version']}" if item.get("version") else item["package"]
+                for item in wheel_items
+            ]
+            setup = (
+                "# pip install --no-index --find-links /wheels <pkg>;"
+                "import os,subprocess,sys;"
+                "subprocess.run([sys.executable,'-m','pip','install','--user','--no-index',"
+                "'--find-links','/wheels',"
+                + ",".join(repr(package) for package in packages)
+                + "],check=True);"
+                "os.execvp(sys.argv[1],sys.argv[1:])"
+            )
+            argv = ["python", "-c", setup, *argv]
         args += [self.settings.sandbox_image, *argv]
         return args, timeout_s
 
@@ -939,12 +1004,15 @@ class Sandbox:
         the tool is SIGKILLed, process group and all, the moment it exceeds
         MAX_STDOUT_BYTES on either stream. No isolation whatsoever.
         """
+        wheel_items = _wheel_dependencies(manifest, self.settings)
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "PYTHONUNBUFFERED": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "HOME": "/tmp",
-            "PYTHONPATH": str(self.settings.repo_root),
+            "PYTHONPATH": os.pathsep.join(
+                [str(self.settings.repo_root), *(item["path"] for item in wheel_items)]
+            ),
             **scrub_env(dict(os.environ), self.settings.env_allowlist),
             **self._tool_env(),
         }

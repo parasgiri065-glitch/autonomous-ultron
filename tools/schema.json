@@ -96,6 +96,11 @@
       "default": 0,
       "description": "Expected spend per invocation, used by the planner's cost model."
     },
-    "author": { "type": "string" }
+    "author": { "type": "string" },
+    "meta": {
+      "type": "object",
+      "description": "Attested forge metadata, including sealed wheel dependency digests.",
+      "additionalProperties": true
+    }
   }
 }

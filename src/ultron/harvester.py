@@ -64,6 +64,56 @@ class PyPIHarvester:
         self.fetcher = fetcher or self._fetch_json
         self.forge = forge or ForgeEngine(self.settings)
 
+    def find_candidates(self, goal: str) -> list[dict[str, Any]]:
+        """Return bounded package candidates for known capability-shaped goals.
+
+        Discovery is deliberately narrow and deterministic.  The subsequent
+        ``WheelFetcher`` performs the host-side PyPI lookup; this method never
+        gives a sandbox network access and returns no candidate for unknown text.
+        """
+        text = (goal or "").casefold()
+        if "cron" not in text or not any(
+            marker in text for marker in ("next", "run time", "schedule", "expression")
+        ):
+            return []
+        return [
+            {
+                "package": "croniter",
+                "package_version": None,
+                "target_function": "run",
+                "code": (
+                    "from datetime import datetime, timezone\n"
+                    "from croniter import croniter\n\n"
+                    "def run(payload):\n"
+                    '    expression = payload["expression"]\n'
+                    '    count = int(payload.get("count", 5))\n'
+                    "    base = datetime.now(timezone.utc)\n"
+                    "    iterator = croniter(expression, base)\n"
+                    '    return {"run_times": [\n'
+                    "        iterator.get_next(datetime).astimezone(timezone.utc).isoformat()\n"
+                    "        for _ in range(count)\n"
+                    "    ]}\n"
+                ),
+                "manifest": {
+                    "name": "cron_schedule",
+                    "version": "0.1.0",
+                    "description": "Calculate upcoming UTC cron schedule times using croniter.",
+                    "risk": "low",
+                    "provides": ["cron.run_times"],
+                    "requires": [],
+                    "permissions": [],
+                    "inputs": {"expression": "string", "count": "int"},
+                    "outputs": {"run_times": "list[string]"},
+                    "tags": ["cron", "schedule", "pypi"],
+                    "deterministic": False,
+                },
+                "test_inputs": {"expression": "0 3 * * *", "count": 2},
+                "expected_schema": {"run_times": "list[string]"},
+            }
+        ]
+
+    search = find_candidates
+
     def inspect_package(self, package_name: str) -> PackageMetadata:
         package = _validate_package_name(package_name)
         try:

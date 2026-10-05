@@ -251,7 +251,11 @@ dynamic registration, and up to three repair attempts are injectable and remain
 offline by default. Successful trajectories may be consolidated into the SQLite soul
 memory graph for zero-cost exact recall. The profile at
 `<state_dir>/soul_profile.json` is operator-controlled grounding context, not a policy
-or secret store.
+or secret store. If rules-first planning returns an unresolved tool gap, `ULTRON_JIT=1`
+(the default) falls through to the typed DAG/JIT runtime; `ULTRON_JIT=0` preserves the
+legacy no-plan result. Host-side PyPI wheels are sealed into `<state_dir>/wheels/`,
+attested with SHA-256, and mounted read-only for offline sandbox installation while the
+sandbox remains `--network=none`.
 
 ```bash
 uv run ultron run "<any goal>" --json
