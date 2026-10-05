@@ -1,0 +1,6 @@
+{
+  "name": "Ada Lovelace",
+  "age": 36,
+  "contact": {"email": "ada@example.test"},
+  "missing": null
+}

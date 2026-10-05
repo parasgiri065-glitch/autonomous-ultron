@@ -1,0 +1,3 @@
+{"id":"html_product","source":"eval/fixtures/extract_product.html","fields":{"name":"string","price":"float","in_stock":"bool","missing":"string"},"expected":{"name":"Acme Widget","price":1299.5,"in_stock":true,"missing":null}}
+{"id":"json_profile","source":"eval/fixtures/extract_profile.json","fields":{"name":"string","age":"int","role":"string","unknown":"string"},"expected":{"name":"Ada Lovelace","age":36,"role":"mathematician","unknown":null}}
+{"id":"csv_scores","source":"eval/fixtures/extract_people.csv","fields":{"name":"list[string]","score":"list[float]"},"expected":{"name":["Ada Lovelace","Grace Hopper"],"score":[98.5,97.0]}}

@@ -25,6 +25,7 @@ from .cache import Cache
 from .config import get_settings
 from .domains.intel import IntelError, IntelResearchEngine
 from .errors import HumanApprovalRequired, PolicyDenied, SandboxUnavailable, UltronError
+from .extractor import ExtractionError, GroundedDataExtractor
 from .forge import ForgeEngine
 from .harvester import HarvestError, PyPIHarvester
 from .interfaces.telegram import TelegramBotClient, TelegramCockpit
@@ -146,6 +147,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     console.print(f"  [dim]tools: {', '.join(registry.names()) or 'none'}[/dim]")
     blocking = [c for c in checks if c["blocking"] and not c["ok"]]
     return 0 if not blocking else 1
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    """Extract caller-declared fields from one local file or approved URL."""
+    try:
+        fields = json.loads(args.fields)
+    except json.JSONDecodeError as exc:
+        raise ExtractionError(f"--fields must be valid JSON: {exc.msg}") from exc
+    extractor = GroundedDataExtractor(get_settings(), interactive=args.interactive)
+    result = extractor.extract(args.source, fields, output_format=args.format, output=args.output)
+    if args.output:
+        # Keep stdout useful for scripts while making the artifact location clear.
+        if args.json:
+            _print_json({"status": "ok" if result.ok else "rejected", "output": str(result.output_path), "result": result.as_dict()})
+        else:
+            sys.stdout.write(f"Wrote {result.output_path}\n")
+    else:
+        sys.stdout.write(result.render(args.format))
+    return 0 if result.ok else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -665,6 +685,28 @@ def _load_eval_module():
     return module
 
 
+def _load_extraction_eval_module():
+    import importlib.util
+
+    path = get_settings().repo_root / "eval" / "extraction_run.py"
+    spec = importlib.util.spec_from_file_location("ultron_extraction_eval", path)
+    if spec is None or spec.loader is None:
+        raise UltronError(f"cannot load extraction eval runner at {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def cmd_extract_eval(args: argparse.Namespace) -> int:
+    report = _load_extraction_eval_module().run_extraction_eval(
+        Path(args.tasks) if args.tasks else None, quiet=args.json
+    )
+    if args.json:
+        _print_json(report.as_dict())
+    return 0 if report.exact_tasks == report.tasks else 1
+
+
 def cmd_eval(args: argparse.Namespace) -> int:
     run_eval = _load_eval_module().run_eval
 
@@ -705,6 +747,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
         return child
 
+    p_extract = add_sub("extract", help="grounded extraction from one URL or local file")
+    p_extract.add_argument("source", help="public http(s) URL or local HTML/CSV/JSON/text/PDF path")
+    p_extract.add_argument("--fields", required=True, help='JSON schema, e.g. \'{"title":"string","price":"float"}\'')
+    p_extract.add_argument("--format", choices=["json", "csv", "md"], default="json")
+    p_extract.add_argument("--output", default=None, help="write the rendered artifact to this path")
+    p_extract.add_argument("--interactive", action="store_true", help="allow the live-network approval prompt")
+    p_extract.set_defaults(func=cmd_extract)
+
     p_run = add_sub("run", help="run one goal through the agent loop")
     p_run.add_argument("goal")
     p_run.add_argument("--max-steps", type=int, default=None)
@@ -733,6 +783,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mem.add_argument("--limit", type=int, default=20)
     p_mem.set_defaults(func=cmd_memory)
+
+    p_extract_eval = add_sub("extract-eval", help="run the offline extractor fixture evaluation")
+    p_extract_eval.add_argument("--tasks", default=None)
+    p_extract_eval.set_defaults(func=cmd_extract_eval)
 
     p_eval = add_sub("eval", help="run the eval harness and gate on thresholds")
     p_eval.add_argument("--tasks", default=None)

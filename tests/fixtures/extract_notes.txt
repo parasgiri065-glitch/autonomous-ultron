@@ -1,0 +1,3 @@
+Project: Grounded Extractor
+Owner: Ada Lovelace
+Deadline: 2026-11-01

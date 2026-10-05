@@ -236,9 +236,37 @@ ultron tools list|show NAME|validate
 ultron cache stats|clear|prune [--namespace tool|llm|web|router|plan|judge]
 ultron memory stats|runs|failures|forget [--limit N]
 ultron eval [--limit N] [--passes 1|2|3] [--backend local|docker] [--json]
+ultron extract <URL-or-path> --fields '{"title":"string","price":"float"}' --format json|csv|md
+ultron extract-eval [--json]        # offline Phase 4.2 fixture accuracy
 ```
 
 `--json` on every subcommand; `python -m ultron.main ...` works without installation.
+
+### Grounded single-page extraction
+
+`ultron extract` accepts one local HTML, CSV, JSON, text, or PDF file, or one public
+`http(s)` URL when live egress is explicitly enabled. The caller must provide a JSON
+object of field names and types; the extractor is deterministic and never fabricates a
+missing value. Missing evidence is represented as `null`, and each present value has a
+source plus a short evidence excerpt and selector/path in the JSON result. PDFs use an
+already-installed `pypdf`/`PyPDF2` dependency when available; otherwise they fail closed
+rather than installing a parser.
+
+The live boundary is deliberately narrower than a crawler: URL credentials, localhost,
+private/link-local/reserved destinations, unsafe redirects, excessive redirects, HTTP
+429 retries, oversized responses, and timeouts are refused. DNS is resolved and every
+returned address is checked; the HTTP client then connects to the checked IP directly
+while preserving the hostname for HTTPS certificate/SNI validation, which avoids a
+hostname re-resolution DNS-rebinding gap. Live extraction requires both
+`ULTRON_EVAL_LIVE=1` and a normal `PolicyGate`/Charter approval; CI and pytest use only
+injected transports and offline fixtures. Extracted results are not written to the
+agent cache or memory.
+
+```bash
+uv run ultron extract page.html --fields '{"title":"string","price":"float"}' --format md
+uv run ultron extract profile.json --fields '{"name":"string","age":"int"}' --format json
+uv run ultron extract-eval --json
+```
 
 ---
 

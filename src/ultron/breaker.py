@@ -15,7 +15,7 @@ from typing import Any
 
 from .provenance import ProvenanceEnvelope
 
-_NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?%?(?![A-Za-z])")
+_NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\d[\d,]*(?:\.\d+)?%?(?![A-Za-z])")
 _ENTITY_RE = re.compile(r"\b[A-Z][A-Za-z0-9_-]{2,}\b")
 _QUOTED_RE = re.compile(r"[\"']([^\"']{3,})[\"']")
 _SUCCESS_RE = re.compile(
@@ -63,7 +63,7 @@ class BreakerVerifier:
         raw_tool_envelopes: Iterable[ProvenanceEnvelope] | None = None,
     ) -> BreakerResult:
         items = list(raw_tool_envelopes if raw_tool_envelopes is not None else (provenance or ()))
-        support = [item for item in items if item.origin in {"sandbox_tool", "web_fetch"}]
+        support = [item for item in items if item.origin in {"sandbox_tool", "web_fetch", "local_file"}]
         raw_text = "\n".join(_evidence_text(item) for item in support)
         final_text = _payload_text(final_payload)
         result = BreakerResult(ok=True)
@@ -155,7 +155,7 @@ def _evidence_text(item: ProvenanceEnvelope) -> str:
 
 
 def _normal_number(value: str) -> str:
-    value = value.rstrip("%")
+    value = value.rstrip("%").replace(",", "")
     try:
         number = float(value)
     except ValueError:
