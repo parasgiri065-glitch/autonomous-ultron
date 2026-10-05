@@ -111,7 +111,14 @@ class ProvenanceEnvelope:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ProvenanceEnvelope:
         origin = value.get("origin")
-        if origin not in {"user", "sandbox_tool", "cache", "web_fetch", "local_file", "llm_generated"}:
+        if origin not in {
+            "user",
+            "sandbox_tool",
+            "cache",
+            "web_fetch",
+            "local_file",
+            "llm_generated",
+        }:
             raise ValueError(f"unknown provenance origin: {origin!r}")
         return cls(
             origin=origin,

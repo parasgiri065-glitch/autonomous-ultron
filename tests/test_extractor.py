@@ -21,7 +21,13 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def test_html_extraction_is_typed_grounded_and_preserves_evidence():
     result = GroundedDataExtractor().extract(
         FIXTURES / "extract_product.html",
-        {"name": "string", "price": "float", "category": "string", "in_stock": "bool", "missing": "string"},
+        {
+            "name": "string",
+            "price": "float",
+            "category": "string",
+            "in_stock": "bool",
+            "missing": "string",
+        },
     )
     assert result.ok
     assert result.fields == {
@@ -61,7 +67,11 @@ def test_text_and_missing_values_are_not_invented():
         {"project": "string", "owner": "string", "unknown": "string"},
     )
     assert result.ok
-    assert result.fields == {"project": "Grounded Extractor", "owner": "Ada Lovelace", "unknown": None}
+    assert result.fields == {
+        "project": "Grounded Extractor",
+        "owner": "Ada Lovelace",
+        "unknown": None,
+    }
     assert result.evidence["unknown"].evidence == "not found"
     assert result.evidence["unknown"].source.endswith("extract_notes.txt")
 
@@ -112,9 +122,9 @@ def test_fetch_limits_timeout_429_and_redirect_limit_are_polite():
         return FetchResponse(_url, b"x" * 11)
 
     with pytest.raises(ExtractionError, match="byte limit"):
-        GroundedDataExtractor(fetcher=too_large, resolver=_public_resolver, max_response_bytes=10).extract(
-            "https://example.com", {"name": "string"}
-        )
+        GroundedDataExtractor(
+            fetcher=too_large, resolver=_public_resolver, max_response_bytes=10
+        ).extract("https://example.com", {"name": "string"})
 
     def timed_out(_url: str):
         raise TimeoutError("deadline")
@@ -136,9 +146,9 @@ def test_fetch_limits_timeout_429_and_redirect_limit_are_polite():
         return FetchResponse(url, b"", 302, {"location": "https://example.com/next"})
 
     with pytest.raises(ExtractionError, match="redirect limit"):
-        GroundedDataExtractor(fetcher=redirect_loop, resolver=_public_resolver, max_redirects=1).extract(
-            "https://example.com", {"name": "string"}
-        )
+        GroundedDataExtractor(
+            fetcher=redirect_loop, resolver=_public_resolver, max_redirects=1
+        ).extract("https://example.com", {"name": "string"})
 
 
 def test_live_fetch_requires_opt_in_and_policy_approval(tmp_path: Path):
@@ -178,4 +188,7 @@ def test_injected_fetcher_is_offline_and_redirects_revalidate():
     )
     assert result.ok
     assert result.fields["name"] == "Offline page"
-    assert json.loads(result.render("json"))["evidence"]["name"]["source"] == "https://example.com/data.json"
+    assert (
+        json.loads(result.render("json"))["evidence"]["name"]["source"]
+        == "https://example.com/data.json"
+    )

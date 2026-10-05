@@ -100,7 +100,7 @@ def test_telegram_extract_delivers_supported_artifact(tmp_path):
             "message": {
                 "from": {"id": 42},
                 "chat": {"id": 42},
-                "text": "/extract tests/fixtures/extract_profile.json --fields '{\"name\":\"string\"}' --format csv",
+                "text": '/extract tests/fixtures/extract_profile.json --fields \'{"name":"string"}\' --format csv',
             },
         }
     )

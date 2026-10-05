@@ -63,7 +63,9 @@ class BreakerVerifier:
         raw_tool_envelopes: Iterable[ProvenanceEnvelope] | None = None,
     ) -> BreakerResult:
         items = list(raw_tool_envelopes if raw_tool_envelopes is not None else (provenance or ()))
-        support = [item for item in items if item.origin in {"sandbox_tool", "web_fetch", "local_file"}]
+        support = [
+            item for item in items if item.origin in {"sandbox_tool", "web_fetch", "local_file"}
+        ]
         raw_text = "\n".join(_evidence_text(item) for item in support)
         final_text = _payload_text(final_payload)
         result = BreakerResult(ok=True)

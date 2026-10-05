@@ -127,7 +127,12 @@ class ExtractionResult:
                 )
             return stream.getvalue()
         if output_format == "md":
-            lines = [f"# Extracted data: {self.source}", "", "| Field | Value | Evidence |", "| --- | --- | --- |"]
+            lines = [
+                f"# Extracted data: {self.source}",
+                "",
+                "| Field | Value | Evidence |",
+                "| --- | --- | --- |",
+            ]
             for key, value in self.fields.items():
                 row = self.evidence.get(key)
                 lines.append(
@@ -135,7 +140,14 @@ class ExtractionResult:
                 )
             if self.errors:
                 lines.extend(["", "## Errors", "", *[f"- {error}" for error in self.errors]])
-            lines.extend(["", "## Provenance", "", *[f"- `{item.source_id}` at {item.timestamp}" for item in self.provenance]])
+            lines.extend(
+                [
+                    "",
+                    "## Provenance",
+                    "",
+                    *[f"- `{item.source_id}` at {item.timestamp}" for item in self.provenance],
+                ]
+            )
             return "\n".join(lines) + "\n"
         raise ExtractionError("format must be json, csv, or md")
 
@@ -158,8 +170,31 @@ class _HTMLNode:
 class _HTMLExtractor:
     """Conservative page text and label/selector collector."""
 
-    SKIP: ClassVar[set[str]] = {"script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form"}
-    BLOCK: ClassVar[set[str]] = {"p", "div", "li", "dt", "dd", "tr", "br", "article", "section", "h1", "h2", "h3"}
+    SKIP: ClassVar[set[str]] = {
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "nav",
+        "header",
+        "footer",
+        "aside",
+        "form",
+    }
+    BLOCK: ClassVar[set[str]] = {
+        "p",
+        "div",
+        "li",
+        "dt",
+        "dd",
+        "tr",
+        "br",
+        "article",
+        "section",
+        "h1",
+        "h2",
+        "h3",
+    }
 
     def __init__(self) -> None:
         from html.parser import HTMLParser
@@ -202,7 +237,10 @@ class _HTMLExtractor:
                     return
                 if not self.stack:
                     return
-                index = next((i for i in range(len(self.stack) - 1, -1, -1) if self.stack[i]["tag"] == tag), None)
+                index = next(
+                    (i for i in range(len(self.stack) - 1, -1, -1) if self.stack[i]["tag"] == tag),
+                    None,
+                )
                 if index is None:
                     return
                 state = self.stack.pop(index)
@@ -210,7 +248,11 @@ class _HTMLExtractor:
                 if state.get("is_title"):
                     self.title_parts.append(value)
                 if value and tag not in {"html", "head", "body"}:
-                    self.nodes.append(_HTMLNode(tag, state["attrs"], value, _selector(state["tag"], state["attrs"])))
+                    self.nodes.append(
+                        _HTMLNode(
+                            tag, state["attrs"], value, _selector(state["tag"], state["attrs"])
+                        )
+                    )
                 if tag in self.outer.BLOCK and value:
                     # Data nodes are already appended in document order; only
                     # add a boundary here so label extraction cannot consume
@@ -320,7 +362,9 @@ class GroundedDataExtractor:
                     if not location:
                         raise ExtractionError("redirect response did not contain Location")
                     current = validate_public_url(
-                        urllib.parse.urljoin(current, location), resolver=self.resolver, resolve_dns=False
+                        urllib.parse.urljoin(current, location),
+                        resolver=self.resolver,
+                        resolve_dns=False,
                     )
                     continue
                 if response.status_code == 429:
@@ -332,7 +376,9 @@ class GroundedDataExtractor:
             raise ExtractionError(f"redirect limit exceeded ({self.max_redirects})")
 
         if not self.settings.eval_live:
-            raise ExtractionPolicyError("live network is disabled; set ULTRON_EVAL_LIVE=1 explicitly")
+            raise ExtractionPolicyError(
+                "live network is disabled; set ULTRON_EVAL_LIVE=1 explicitly"
+            )
         self._authorize_network(safe)
         return safe_http_get(
             safe,
@@ -353,7 +399,9 @@ class GroundedDataExtractor:
             inputs={"url": "string"},
             outputs={"content": "string"},
         )
-        gate = self.policy_gate or PolicyGate(self.settings, charter=Charter(self.settings.state_dir))
+        gate = self.policy_gate or PolicyGate(
+            self.settings, charter=Charter(self.settings.state_dir)
+        )
         request = PolicyRequest(
             tool=manifest,
             inputs={"url": url},
@@ -364,7 +412,9 @@ class GroundedDataExtractor:
         try:
             gate.evaluate(request, interactive=self.interactive)
         except (HumanApprovalRequired, PolicyDenied) as exc:
-            raise ExtractionPolicyError(f"network extraction requires explicit approval: {exc}") from exc
+            raise ExtractionPolicyError(
+                f"network extraction requires explicit approval: {exc}"
+            ) from exc
 
     def _extract_content(
         self, source: str, content_type: str, content: bytes, schema: dict[str, str]
@@ -373,7 +423,10 @@ class GroundedDataExtractor:
             raise ExtractionError(f"source exceeds {self.max_response_bytes} byte limit")
         provenance_origin = "web_fetch" if _is_url(source) else "local_file"
         envelope = ProvenanceEnvelope.create(
-            provenance_origin, source, content.decode("utf-8", "replace"), metadata={"source": source, "content_type": content_type}
+            provenance_origin,
+            source,
+            content.decode("utf-8", "replace"),
+            metadata={"source": source, "content_type": content_type},
         )
         try:
             if content_type == "application/pdf":
@@ -418,7 +471,9 @@ class GroundedDataExtractor:
         breaker = BreakerVerifier()
         breaker_result = breaker.verify(fields, [envelope])
         if not breaker_result.ok:
-            errors.append("Breaker rejected unsupported extracted value(s): " + breaker_result.reason)
+            errors.append(
+                "Breaker rejected unsupported extracted value(s): " + breaker_result.reason
+            )
         return ExtractionResult(
             source,
             content_type,
@@ -460,7 +515,12 @@ def validate_public_url(
     if parsed.scheme.casefold() not in {"http", "https"}:
         raise ExtractionError("only http and https URLs are supported")
     try:
-        username, password, hostname, port = parsed.username, parsed.password, parsed.hostname, parsed.port
+        username, password, hostname, port = (
+            parsed.username,
+            parsed.password,
+            parsed.hostname,
+            parsed.port,
+        )
     except ValueError as exc:
         raise ExtractionError(f"malformed URL: {exc}") from exc
     if username is not None or password is not None:
@@ -476,7 +536,11 @@ def validate_public_url(
     except ValueError as invalid_literal:
         if resolve_dns:
             try:
-                answers = resolver(hostname, port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+                answers = resolver(
+                    hostname,
+                    port or (443 if parsed.scheme == "https" else 80),
+                    type=socket.SOCK_STREAM,
+                )
                 addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
                 for answer in answers:
                     if len(answer) <= 4:
@@ -484,21 +548,38 @@ def validate_public_url(
                     try:
                         addresses.add(ipaddress.ip_address(answer[4][0]))
                     except (IndexError, TypeError, ValueError) as exc:
-                        raise ExtractionError("DNS returned a malformed address; refusing fetch") from exc
+                        raise ExtractionError(
+                            "DNS returned a malformed address; refusing fetch"
+                        ) from exc
             except ExtractionError:
                 raise
             except (OSError, socket.gaierror) as exc:
-                raise ExtractionError(f"DNS resolution failed for {hostname!r}; refusing fetch") from exc
+                raise ExtractionError(
+                    f"DNS resolution failed for {hostname!r}; refusing fetch"
+                ) from exc
             if not addresses:
-                raise ExtractionError("DNS returned no usable addresses; refusing fetch") from invalid_literal
+                raise ExtractionError(
+                    "DNS returned no usable addresses; refusing fetch"
+                ) from invalid_literal
             for address in addresses:
                 _assert_public_ip(address)
-    return urllib.parse.urlunsplit((parsed.scheme.casefold(), parsed.netloc, parsed.path or "/", parsed.query, ""))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.casefold(), parsed.netloc, parsed.path or "/", parsed.query, "")
+    )
 
 
 def _assert_public_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
-    if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_multicast or address.is_unspecified:
-        raise ExtractionError(f"private, reserved, or link-local destination is forbidden: {address}")
+    if (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    ):
+        raise ExtractionError(
+            f"private, reserved, or link-local destination is forbidden: {address}"
+        )
 
 
 def safe_http_get(
@@ -517,7 +598,9 @@ def safe_http_get(
             location = response.headers.get("location")
             if not location:
                 raise ExtractionError("redirect response did not contain Location")
-            current = validate_public_url(urllib.parse.urljoin(current, location), resolver=resolver)
+            current = validate_public_url(
+                urllib.parse.urljoin(current, location), resolver=resolver
+            )
             continue
         if response.status_code == 429:
             retry = response.headers.get("retry-after", "later")
@@ -528,7 +611,9 @@ def safe_http_get(
     raise ExtractionError(f"redirect limit exceeded ({max_redirects})")
 
 
-def _one_safe_http_request(url: str, timeout_s: float, max_bytes: int, resolver: Callable[..., list[tuple[Any, ...]]]) -> FetchResponse:
+def _one_safe_http_request(
+    url: str, timeout_s: float, max_bytes: int, resolver: Callable[..., list[tuple[Any, ...]]]
+) -> FetchResponse:
     parsed = urllib.parse.urlsplit(validate_public_url(url, resolver=resolver))
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
@@ -595,7 +680,12 @@ def _coerce_response(raw: FetchResponse | str | bytes | dict[str, Any], url: str
         body = raw.get("content", raw.get("body", ""))
         if isinstance(body, str):
             body = body.encode()
-        return FetchResponse(str(raw.get("url", url)), bytes(body), int(raw.get("status_code", 200)), {str(k).casefold(): str(v) for k, v in dict(raw.get("headers", {})).items()})
+        return FetchResponse(
+            str(raw.get("url", url)),
+            bytes(body),
+            int(raw.get("status_code", 200)),
+            {str(k).casefold(): str(v) for k, v in dict(raw.get("headers", {})).items()},
+        )
     return FetchResponse(url, raw.encode() if isinstance(raw, str) else bytes(raw))
 
 
@@ -611,12 +701,20 @@ def _find_value(name: str, parsed: Any, kind: str, source: str) -> tuple[Any, st
         return value, json.dumps(value, default=str), path
     if kind == "csv":
         rows = parsed if isinstance(parsed, list) else []
-        values = [row.get(name) for row in rows if isinstance(row, dict) and row.get(name) not in (None, "")]
+        values = [
+            row.get(name)
+            for row in rows
+            if isinstance(row, dict) and row.get(name) not in (None, "")
+        ]
         if name.startswith("rows."):
             name = name.split(".", 1)[1]
         if len(values) > 1:
             return values, "; ".join(str(value) for value in values), f"CSV column {name}"
-        return (values[0], str(values[0]), f"CSV row 1 column {name}") if values else (None, "not found", f"CSV column {name}")
+        return (
+            (values[0], str(values[0]), f"CSV row 1 column {name}")
+            if values
+            else (None, "not found", f"CSV column {name}")
+        )
     if kind == "html":
         title, body, nodes = parsed
         if name.casefold() == "title":
@@ -624,7 +722,11 @@ def _find_value(name: str, parsed: Any, kind: str, source: str) -> tuple[Any, st
         key = _norm_name(name)
         for index, node in enumerate(nodes):
             attrs = {attr.casefold(): value for attr, value in node.attrs.items()}
-            if key in {_norm_name(attrs.get("id", "")), _norm_name(attrs.get("name", "")), _norm_name(attrs.get("data-field", ""))}:
+            if key in {
+                _norm_name(attrs.get("id", "")),
+                _norm_name(attrs.get("name", "")),
+                _norm_name(attrs.get("data-field", "")),
+            }:
                 return node.text, node.text, node.selector
             if key and key in {_norm_name(item) for item in attrs.get("class", "").split()}:
                 return node.text, node.text, node.selector
@@ -682,7 +784,11 @@ def coerce_value(value: Any, declared: str) -> Any:
             return False
         raise ValueError("expected bool")
     if declared.startswith("list["):
-        values = value if isinstance(value, list) else [part.strip() for part in str(value).split(",") if part.strip()]
+        values = (
+            value
+            if isinstance(value, list)
+            else [part.strip() for part in str(value).split(",") if part.strip()]
+        )
         subtype = declared[5:-1]
         return [coerce_value(item, subtype) for item in values]
     if declared == "dict":
@@ -699,7 +805,9 @@ def _pdf_text(content: bytes) -> str:
         try:
             from PyPDF2 import PdfReader  # type: ignore[import-not-found]
         except ImportError as exc:
-            raise ExtractionError("PDF extraction is unavailable: no existing PDF parser dependency") from exc
+            raise ExtractionError(
+                "PDF extraction is unavailable: no existing PDF parser dependency"
+            ) from exc
     try:
         reader = PdfReader(io.BytesIO(content))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -729,7 +837,13 @@ def _short_excerpt(value: str, limit: int = 240) -> str:
 
 
 def _csv_value(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else "" if value is None else str(value)
+    return (
+        json.dumps(value, ensure_ascii=False, default=str)
+        if isinstance(value, (dict, list))
+        else ""
+        if value is None
+        else str(value)
+    )
 
 
 def _is_url(value: str) -> bool:
@@ -738,11 +852,31 @@ def _is_url(value: str) -> bool:
 
 def _content_type(value: str, source: str) -> str:
     value = value.split(";", 1)[0].strip().casefold()
-    return value if value in {"text/html", "application/xhtml+xml", "application/json", "text/csv", "text/plain", "application/pdf"} else _content_type_from_suffix(Path(urllib.parse.urlsplit(source).path).suffix.casefold())
+    return (
+        value
+        if value
+        in {
+            "text/html",
+            "application/xhtml+xml",
+            "application/json",
+            "text/csv",
+            "text/plain",
+            "application/pdf",
+        }
+        else _content_type_from_suffix(Path(urllib.parse.urlsplit(source).path).suffix.casefold())
+    )
 
 
 def _content_type_from_suffix(suffix: str) -> str:
-    return {".html": "text/html", ".htm": "text/html", ".json": "application/json", ".csv": "text/csv", ".pdf": "application/pdf", ".txt": "text/plain", ".text": "text/plain"}.get(suffix, "text/plain")
+    return {
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".json": "application/json",
+        ".csv": "text/csv",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".text": "text/plain",
+    }.get(suffix, "text/plain")
 
 
 def _within_path(path: Path, root: Path) -> bool:

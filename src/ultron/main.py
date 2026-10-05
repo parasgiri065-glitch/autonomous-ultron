@@ -160,7 +160,13 @@ def cmd_extract(args: argparse.Namespace) -> int:
     if args.output:
         # Keep stdout useful for scripts while making the artifact location clear.
         if args.json:
-            _print_json({"status": "ok" if result.ok else "rejected", "output": str(result.output_path), "result": result.as_dict()})
+            _print_json(
+                {
+                    "status": "ok" if result.ok else "rejected",
+                    "output": str(result.output_path),
+                    "result": result.as_dict(),
+                }
+            )
         else:
             sys.stdout.write(f"Wrote {result.output_path}\n")
     else:
@@ -749,10 +755,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_extract = add_sub("extract", help="grounded extraction from one URL or local file")
     p_extract.add_argument("source", help="public http(s) URL or local HTML/CSV/JSON/text/PDF path")
-    p_extract.add_argument("--fields", required=True, help='JSON schema, e.g. \'{"title":"string","price":"float"}\'')
+    p_extract.add_argument(
+        "--fields", required=True, help='JSON schema, e.g. \'{"title":"string","price":"float"}\''
+    )
     p_extract.add_argument("--format", choices=["json", "csv", "md"], default="json")
-    p_extract.add_argument("--output", default=None, help="write the rendered artifact to this path")
-    p_extract.add_argument("--interactive", action="store_true", help="allow the live-network approval prompt")
+    p_extract.add_argument(
+        "--output", default=None, help="write the rendered artifact to this path"
+    )
+    p_extract.add_argument(
+        "--interactive", action="store_true", help="allow the live-network approval prompt"
+    )
     p_extract.set_defaults(func=cmd_extract)
 
     p_run = add_sub("run", help="run one goal through the agent loop")

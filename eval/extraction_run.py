@@ -48,16 +48,22 @@ class ExtractionEvalReport:
         }
 
 
-def run_extraction_eval(tasks_path: Path | None = None, *, quiet: bool = False) -> ExtractionEvalReport:
+def run_extraction_eval(
+    tasks_path: Path | None = None, *, quiet: bool = False
+) -> ExtractionEvalReport:
     path = tasks_path or ROOT / "eval" / "extraction_tasks.jsonl"
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
     extractor = GroundedDataExtractor()
     cases: list[dict[str, Any]] = []
     matched_fields = 0
     field_count = 0
     exact_tasks = 0
     for row in rows:
-        source = ROOT / row["source"] if not Path(row["source"]).is_absolute() else Path(row["source"])
+        source = (
+            ROOT / row["source"] if not Path(row["source"]).is_absolute() else Path(row["source"])
+        )
         result = extractor.extract(source, row["fields"])
         actual = result.fields
         expected = row["expected"]
@@ -76,7 +82,9 @@ def run_extraction_eval(tasks_path: Path | None = None, *, quiet: bool = False) 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", type=Path, default=None)
-    parser.add_argument("--json", action="store_true", help="same JSON report; retained for CLI symmetry")
+    parser.add_argument(
+        "--json", action="store_true", help="same JSON report; retained for CLI symmetry"
+    )
     args = parser.parse_args(argv)
     report = run_extraction_eval(args.tasks, quiet=False)
     return 0 if report.exact_tasks == report.tasks else 1

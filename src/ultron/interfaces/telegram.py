@@ -349,7 +349,9 @@ class TelegramCockpit:
         try:
             tokens = shlex.split(arguments)
             if not tokens:
-                raise ExtractionError("usage: /extract <URL-or-path> --fields '{\"name\":\"string\"}' --format json|csv|md")
+                raise ExtractionError(
+                    'usage: /extract <URL-or-path> --fields \'{"name":"string"}\' --format json|csv|md'
+                )
             source = tokens[0]
             fields_arg: str | None = None
             output_format = "json"
@@ -394,7 +396,9 @@ class TelegramCockpit:
             self.client.send_message(chat_id, rendered[:3800])
             if result.ok:
                 artifact = result.write_artifact(
-                    self.settings.state_dir / "extract" / f"extract-{int(time.time())}.{output_format}",
+                    self.settings.state_dir
+                    / "extract"
+                    / f"extract-{int(time.time())}.{output_format}",
                     output_format,
                 )
                 self.client.send_document(chat_id, artifact, caption="Grounded extraction artifact")
