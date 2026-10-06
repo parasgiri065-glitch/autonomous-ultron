@@ -1,0 +1,77 @@
+name: Live sealed goal
+
+on:
+  workflow_dispatch:
+    inputs:
+      goal:
+        description: Goal to run through the sealed JIT engine
+        required: true
+        default: "Parse the cron expression '0 3 * * *' and give me the next 5 run times in UTC, as ISO 8601 timestamps"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  live-goal:
+    name: live sealed goal
+    runs-on: ubuntu-latest
+    env:
+      GOAL: ${{ inputs.goal }}
+      ULTRON_JIT: "1"
+      ULTRON_SANDBOX: docker
+      ULTRON_SANDBOX_IMAGE: ultron-tools:phase1
+      ULTRON_ALLOW_LOCAL_SANDBOX: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Build the tool image
+        run: docker build -t ultron-tools:phase1 -f docker/Dockerfile .
+
+      - name: Assert local sandbox is unavailable
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${ULTRON_ALLOW_LOCAL_SANDBOX}" ]]; then
+            echo "::error::ULTRON_ALLOW_LOCAL_SANDBOX must be empty"
+            exit 1
+          fi
+          if [[ "${ULTRON_SANDBOX}" != "docker" ]]; then
+            echo "::error::ULTRON_SANDBOX must be docker"
+            exit 1
+          fi
+
+      - name: Run live goal and publish transcript
+        shell: bash
+        run: |
+          set -o pipefail
+          transcript="$RUNNER_TEMP/live-goal-transcript.txt"
+          set +e
+          uv run ultron run "$GOAL" 2>&1 | tee "$transcript"
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "## Live goal transcript"
+            echo
+            echo "**Goal:** $GOAL"
+            echo
+            echo '```text'
+            cat "$transcript"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$exit_code"
