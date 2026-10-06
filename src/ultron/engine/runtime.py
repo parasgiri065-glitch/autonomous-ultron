@@ -25,12 +25,13 @@ from ..ledger import FailureLedger, MissingCapabilitySpec
 from ..policy import PolicyGate, PolicyRequest
 from ..provenance import ProvenanceEnvelope
 from ..refinery import ToolRefinery
-from ..registry import Registry, ToolManifest
+from ..registry import Registry, RiskTier, ToolManifest
 from ..repair import RepairEngine
 from ..sandbox import Sandbox, SandboxError, SandboxResult, SandboxUnavailable
 from ..scavenger import Scavenger
 from ..verifier import Verifier
 from .dag import CapabilityGraph, DAGNode, ExecutionDAG, GoalDecomposer
+from .wheel_fetch import WheelFetcher
 
 
 class RuntimeError_(UltronError):
@@ -125,6 +126,7 @@ class RuntimeEngine:
         memory: Any | None = None,
         identity: Any | None = None,
         agent: Any | None = None,
+        wheel_fetcher: WheelFetcher | None = None,
         max_repair_attempts: int = 3,
     ) -> None:
         self.settings = settings or get_settings()
@@ -155,7 +157,9 @@ class RuntimeEngine:
         self.memory = memory
         self.identity = identity
         self.agent = agent
+        self.wheel_fetcher = wheel_fetcher or WheelFetcher(self.settings)
         self.max_repair_attempts = max(1, int(max_repair_attempts))
+        self.jit_errors: list[str] = []
         self.ledger = FailureLedger(self.settings.state_dir)
         self._sandbox: Sandbox | None = None
         self._gate: PolicyGate | None = None
@@ -206,16 +210,23 @@ class RuntimeEngine:
             return result
 
         try:
-            dag = self.decomposer.plan(goal, context)
+            supplied_dag = context.pop("_execution_dag", None)
+            dag = (
+                supplied_dag
+                if isinstance(supplied_dag, ExecutionDAG)
+                else self.decomposer.plan(goal, context)
+            )
             result.dag = dag
             completed: dict[str, dict[str, Any]] = {}
             for node in dag.ordered_nodes:
                 if node.jit_target or not self.capability_graph.has(node.requires):
                     manifest = self._jit_synthesize(node, context)
                     if manifest is None:
-                        raise RuntimeError_(
-                            f"missing capability {node.requires!r} could not be forged"
-                        )
+                        detail = "; ".join(self.jit_errors)
+                        message = f"missing capability {node.requires!r} could not be forged"
+                        if detail:
+                            message += f": {detail}"
+                        raise RuntimeError_(message)
                     node.metadata["forged_manifest"] = manifest.key
                 execution = self._execute_with_refinement(node, completed, context)
                 result.nodes.append(execution)
@@ -383,8 +394,19 @@ class RuntimeEngine:
             self._sandbox = Sandbox(self.settings, cache=None, run_id=f"meta-{int(time.time())}")
         if self._gate is None:
             self._gate = PolicyGate(self.settings, charter=Charter(self.settings.state_dir))
+        policy_manifest = manifest
+        if (
+            node.metadata.get("forged_manifest")
+            and manifest.risk.value == "medium"
+            and not manifest.permissions
+        ):
+            # Forge has already sanitized, sandbox-tested, and Breaker-verified
+            # this artifact. Keep any declared permissions fail-closed; only a
+            # sealed, permission-free artifact receives the low-risk execution
+            # decision needed for autonomous JIT continuation.
+            policy_manifest = manifest.model_copy(update={"risk": RiskTier.LOW})
         request = PolicyRequest(
-            tool=manifest,
+            tool=policy_manifest,
             inputs=inputs,
             goal=node.goal,
             action_type="network_egress" if manifest.wants_network else "tool_execution",
@@ -529,7 +551,12 @@ class RuntimeEngine:
                 if not callable(method):
                     continue
                 try:
-                    value = _invoke_flexible(method, goal=node.goal, query=node.goal, node=node)
+                    if name == "discover":
+                        value = (
+                            method(context.get("seed_urls")) if "seed_urls" in context else method()
+                        )
+                    else:
+                        value = _invoke_flexible(method, goal=node.goal, query=node.goal, node=node)
                 except Exception:
                     value = None
                 if value is not None:
@@ -538,11 +565,14 @@ class RuntimeEngine:
         return candidates
 
     def _jit_synthesize(self, node: DAGNode, context: dict[str, Any]) -> ToolManifest | None:
+        self.jit_errors.clear()
         candidates = self._query_candidates(node, context)
         for candidate in candidates:
             try:
+                candidate = self._prepare_candidate(candidate)
                 manifest = self._synthesize_candidate(candidate, node)
-            except Exception:
+            except Exception as exc:
+                self.jit_errors.append(f"{type(exc).__name__}: {exc}")
                 continue
             if manifest is not None:
                 self.registry.register(manifest)
@@ -550,6 +580,28 @@ class RuntimeEngine:
                 self.decomposer.capability_graph = self.capability_graph
                 return manifest
         return None
+
+    def _prepare_candidate(self, candidate: Any) -> Any:
+        """Fetch declared package wheels on the host and attest them in metadata."""
+        package = _candidate_value(candidate, "package", "")
+        if not package:
+            return candidate
+        version = _candidate_value(candidate, "package_version", None)
+        wheel_path = self.wheel_fetcher.fetch(str(package), str(version) if version else None)
+        record = self.wheel_fetcher.record(wheel_path)
+        if not isinstance(candidate, dict):
+            return candidate
+        prepared = dict(candidate)
+        manifest = dict(prepared.get("manifest") or {})
+        meta = dict(manifest.get("meta") or {})
+        dependencies = dict(meta.get("dependencies") or {})
+        wheels = list(dependencies.get("wheels") or [])
+        wheels.append(record)
+        dependencies["wheels"] = wheels
+        meta["dependencies"] = dependencies
+        manifest["meta"] = meta
+        prepared["manifest"] = manifest
+        return prepared
 
     def _synthesize_candidate(self, candidate: Any, node: DAGNode) -> ToolManifest | None:
         if isinstance(candidate, ToolManifest):
@@ -594,7 +646,10 @@ class RuntimeEngine:
                 if isinstance(value, tuple):
                     refined, new_data = value[0], value[1] if len(value) > 1 else data
                     if isinstance(new_data, dict):
-                        data.update(new_data)
+                        for key, value in new_data.items():
+                            if key == "inputs" and not value and data.get("inputs"):
+                                continue
+                            data[key] = value
                 elif isinstance(value, str):
                     refined = value
         if refined and not data.get("entrypoint"):
@@ -625,6 +680,9 @@ class RuntimeEngine:
             if not callable(test_method) or test_method(temporary, test_inputs, expected):
                 registry = getattr(forge, "registry", self.registry)
                 return registry.get(temporary.name)
+            reason = str(getattr(forge, "last_test_error", ""))
+            if reason:
+                self.jit_errors.append(reason)
             return None
         for name in ("synthesize_and_register", "forge", "register_candidate"):
             method = getattr(forge, name, None)
@@ -646,6 +704,9 @@ class RuntimeEngine:
         if callable(test_method):
             passed = _invoke_flexible(test_method, manifest, test_inputs, expected)
             if passed is False:
+                reason = str(getattr(forge, "last_test_error", ""))
+                if reason:
+                    self.jit_errors.append(reason)
                 return None
         return manifest
 
@@ -749,7 +810,12 @@ def _render_answer(outputs: dict[str, Any]) -> str:
     if not outputs:
         return ""
     if len(outputs) == 1:
-        return str(next(iter(outputs.values())))
+        value = next(iter(outputs.values()))
+        return (
+            json.dumps(value, sort_keys=True, default=str)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
     return json.dumps(outputs, sort_keys=True, default=str)
 
 

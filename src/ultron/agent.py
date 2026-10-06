@@ -21,6 +21,7 @@ Cost discipline baked into the loop:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -360,13 +361,19 @@ class Agent:
 
             # --- 3. execute steps -------------------------------------------
             if plan.is_empty:
-                self.ledger.record_gap(
+                gap = self.ledger.record_gap(
                     goal,
                     expected_outputs={"answer": "string"},
                     suggested_provides=["answer.text"],
                     failure_reason="planner found no executable tool or capability chain",
                 )
                 result.notes.append("missing capability recorded in the failure ledger")
+                if route.meta_loop_eligible and self.settings.jit_enabled:
+                    meta_result = self._run_meta_loop_fallthrough(
+                        goal, route, gap, result, run_id, started
+                    )
+                    if meta_result is not None:
+                        return meta_result
                 if self.forge_engine is not None and goal not in self._forge_attempted:
                     self._forge_attempted.add(goal)
                     forged = self.forge_engine.auto_forge_from_ledger(top_n=1)
@@ -687,6 +694,159 @@ class Agent:
                 f"{r.get('tool')} ({r.get('reason')})" for r in result.refused
             )
         return text
+
+    def _run_meta_loop_fallthrough(
+        self,
+        goal: str,
+        route: RouteDecision,
+        gap: Any,
+        result: AgentResult,
+        run_id: str,
+        started: float,
+    ) -> AgentResult | None:
+        """Send an unresolved rules-first goal into the bounded Phase 5 runtime."""
+        from .engine.dag import CapabilityGraph, GoalDecomposer
+        from .engine.runtime import RuntimeEngine
+
+        capability = self._jit_capability(goal)
+        node_inputs = self._cron_inputs(goal)
+        context: dict[str, Any] = {
+            "nodes": [
+                {
+                    "id": "goal",
+                    "goal": goal,
+                    "required_capability": capability,
+                    "inputs": {
+                        key: "string" if isinstance(value, str) else "int"
+                        for key, value in node_inputs.items()
+                    },
+                    "outputs": {"run_times": "list[string]"}
+                    if capability == "cron.run_times"
+                    else {"answer": "string"},
+                }
+            ],
+            "inputs": node_inputs,
+            "available_capabilities": self.registry.names(),
+            "failure_gap": gap.as_dict(),
+        }
+        runtime = RuntimeEngine(
+            self.settings,
+            registry=self.registry,
+            decomposer=GoalDecomposer(
+                self.registry, capability_graph=CapabilityGraph(self.registry)
+            ),
+            breaker=self.breaker,
+            verifier=self.verifier.verify,
+        )
+        dag = runtime.plan(goal, context)
+        trace = f"router -> meta-loop: {len(dag.nodes)} nodes, {len(dag.jit_targets)} JIT"
+        result.notes.append(trace)
+        meta_result = runtime.run(
+            goal,
+            {
+                **context,
+                "_execution_dag": dag,
+            },
+        )
+        if not meta_result.ok:
+            result.notes.extend(meta_result.errors)
+            return None
+        result.chain = list(meta_result.trajectory)
+        result.plan = Plan(
+            goal=goal,
+            depth=route.plan_depth,
+            steps=self._meta_plan_steps(dag),
+            rationale="typed DAG fall-through from unresolved rules-first route",
+            created_by="none",
+            resolved=meta_result.ok,
+            notes=[trace, *meta_result.errors],
+            chain=list(meta_result.trajectory),
+        )
+        for index, execution in enumerate(meta_result.nodes):
+            manifest = self._meta_manifest(dag, execution.node_id)
+            if manifest is None:
+                continue
+            result.steps.append(
+                StepReport(
+                    index=index,
+                    tool=manifest.name,
+                    version=manifest.version,
+                    inputs={},
+                    risk=manifest.risk.value,
+                    policy_action="meta-loop",
+                    policy_reason="router fall-through",
+                    network=manifest.network_detail or "none",
+                    ok=execution.ok,
+                    duration_s=0.0,
+                    verification=VerificationResult(
+                        ok=execution.verified,
+                        score=1.0 if execution.verified else 0.0,
+                        reason=execution.error,
+                    ),
+                    error=execution.error or None,
+                    result=execution.result,
+                    provenance=execution.provenance,
+                )
+            )
+        result.answer = meta_result.answer or "No tool produced a usable result for this goal."
+        result.answer_source = "tools" if meta_result.ok else "none"
+        result.status = "ok" if meta_result.ok else "failed"
+        result.ok = meta_result.ok
+        result.notes.extend(meta_result.errors)
+        return self._finalize(result, run_id=run_id, started=started)
+
+    @staticmethod
+    def _jit_capability(goal: str) -> str:
+        lowered = goal.casefold()
+        if "cron" in lowered and any(
+            marker in lowered for marker in ("next", "run time", "schedule")
+        ):
+            return "cron.run_times"
+        slug = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")[:80] or "goal"
+        return f"jit.{slug}"
+
+    @staticmethod
+    def _cron_inputs(goal: str) -> dict[str, Any]:
+        match = re.search(r"cron expression ['\"]([^'\"]+)['\"]", goal, flags=re.I)
+        return {"expression": match.group(1), "count": 5} if match else {}
+
+    def _meta_manifest(self, dag: Any, node_id: str) -> Any | None:
+        node = dag.nodes.get(node_id)
+        if node is None:
+            return None
+        manifest_name = node.metadata.get("forged_manifest") or node.metadata.get("manifest")
+        if manifest_name:
+            try:
+                return self.registry.get(str(manifest_name))
+            except Exception:
+                return None
+        try:
+            return self.registry.get(node.requires)
+        except Exception:
+            from .engine.dag import CapabilityGraph
+
+            providers = CapabilityGraph(self.registry).providers(node.requires)
+            return self.registry.get(providers[0]) if providers else None
+
+    def _meta_plan_steps(self, dag: Any) -> list[PlanStep]:
+        steps: list[PlanStep] = []
+        for index, node in enumerate(dag.ordered_nodes):
+            manifest = self._meta_manifest(dag, node.node_id)
+            if manifest is None:
+                continue
+            steps.append(
+                PlanStep(
+                    index=index,
+                    tool=manifest.name,
+                    version=manifest.version,
+                    inputs={},
+                    risk=manifest.risk.value,
+                    reason="typed meta-loop DAG node",
+                    expected_outputs=dict(manifest.outputs),
+                    deterministic=manifest.deterministic,
+                )
+            )
+        return steps
 
     def _finish_without_tools(
         self, result: AgentResult, run_id: str, started: float, goal: str

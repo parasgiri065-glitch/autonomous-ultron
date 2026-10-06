@@ -57,6 +57,7 @@ class ForgeEngine:
             "failed": [],
             "skipped": [],
         }
+        self.last_test_error = ""
 
     def add_template(
         self,
@@ -143,6 +144,7 @@ class ForgeEngine:
         expected_schema: dict[str, str],
     ) -> bool:
         """Run, verify, and register a forged tool; discard failures."""
+        self.last_test_error = ""
         artifact = self._artifacts.get(manifest.key)
         if artifact is None:
             raise ManifestError(f"no temporary forge artifact for {manifest.key}")
@@ -191,10 +193,12 @@ class ForgeEngine:
                 self.ledger.record_attempt(artifact.spec, failure_reason="forge verified")
                 self._register_artifact(manifest, artifact)
                 return True
-            self._discard_artifact(artifact, reason or outcome.error or "forge verification failed")
+            self.last_test_error = reason or outcome.error or "forge verification failed"
+            self._discard_artifact(artifact, self.last_test_error)
             return False
         except Exception as exc:
-            self._discard_artifact(artifact, f"forge test error: {type(exc).__name__}: {exc}")
+            self.last_test_error = f"forge test error: {type(exc).__name__}: {exc}"
+            self._discard_artifact(artifact, self.last_test_error)
             return False
 
     def auto_forge(self, **kwargs: Any) -> list[ToolManifest]:

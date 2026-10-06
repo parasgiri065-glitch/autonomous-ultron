@@ -116,6 +116,9 @@ class Settings(BaseModel):
     # Optional, explicitly enabled network tiers. Defaults remain hermetic.
     allow_zero_auth: bool = False
     scavenge_enabled: bool = False
+    # Rules-first no-plan goals may fall through to the bounded meta-loop.
+    # Enabled by default, with an explicit opt-out for legacy behavior.
+    jit_enabled: bool = True
 
     # --- Telegram cockpit --------------------------------------------------
     telegram_bot_token: str | None = None
@@ -223,6 +226,7 @@ def load_settings(**overrides: object) -> Settings:
         "cost_simulate": _env_bool("ULTRON_COST_SIMULATE", False),
         "allow_zero_auth": _env_bool("ULTRON_ALLOW_ZERO_AUTH", False),
         "scavenge_enabled": _env_bool("ULTRON_SCAVENGE", False),
+        "jit_enabled": _env_bool("ULTRON_JIT", True),
         "telegram_bot_token": _env("TELEGRAM_BOT_TOKEN"),
         "telegram_allowed_user_ids": _env_int_list("TELEGRAM_ALLOWED_USERS"),
         "budget_max_usd": _env_float("ULTRON_BUDGET_MAX_USD", 0.05),

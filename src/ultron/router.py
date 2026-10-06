@@ -113,6 +113,11 @@ class RouteDecision:
         """True when this goal can be served without any LLM spend at all."""
         return self.source in {"cache", "rules"} and self.plan_depth <= 1
 
+    @property
+    def meta_loop_eligible(self) -> bool:
+        """Whether an unresolved rules-first plan may enter the JIT fall-through."""
+        return bool(self.needs_tools)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "difficulty": self.difficulty,

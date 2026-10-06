@@ -24,6 +24,8 @@ eval/last_report.md
 
 # generated review artifacts (scripts/collect_review.py) — never committed
 review_bundle.md
+# runtime-forged tools are persisted locally, never committed
+/tools/dynamic/
 phase1.bundle
 phase1.tar.gz
 

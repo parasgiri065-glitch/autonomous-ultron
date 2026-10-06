@@ -11,6 +11,7 @@ from .runtime import (
     RuntimeResult,
     UniversalRuntime,
 )
+from .wheel_fetch import WheelFetcher, WheelFetchError
 
 __all__ = [
     "DAG",
@@ -27,4 +28,6 @@ __all__ = [
     "RuntimeEngine",
     "RuntimeResult",
     "UniversalRuntime",
+    "WheelFetchError",
+    "WheelFetcher",
 ]
