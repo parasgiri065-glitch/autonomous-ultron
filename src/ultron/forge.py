@@ -184,7 +184,12 @@ class ForgeEngine:
             )
             breaker = BreakerVerifier().verify(outcome.result, outcome.provenance)
             passed = bool(outcome.ok and verification.ok and breaker.ok)
-            reason = verification.reason if not verification.ok else breaker.reason
+            # Prefer the sandbox error: a failed run (e.g. pip resolver failure
+            # inside the container) is the real cause, while the verifier's
+            # "no result object" is only its downstream symptom.
+            reason = outcome.error or (
+                verification.reason if not verification.ok else breaker.reason
+            )
             if passed:
                 for item in outcome.provenance:
                     if item.origin in {"sandbox_tool", "web_fetch"}:

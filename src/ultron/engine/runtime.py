@@ -582,13 +582,12 @@ class RuntimeEngine:
         return None
 
     def _prepare_candidate(self, candidate: Any) -> Any:
-        """Fetch declared package wheels on the host and attest them in metadata."""
+        """Seal declared package wheels (and their dependency closure) on the host."""
         package = _candidate_value(candidate, "package", "")
         if not package:
             return candidate
         version = _candidate_value(candidate, "package_version", None)
-        wheel_path = self.wheel_fetcher.fetch(str(package), str(version) if version else None)
-        record = self.wheel_fetcher.record(wheel_path)
+        records = self.wheel_fetcher.fetch_closure(str(package), str(version) if version else None)
         if not isinstance(candidate, dict):
             return candidate
         prepared = dict(candidate)
@@ -596,7 +595,7 @@ class RuntimeEngine:
         meta = dict(manifest.get("meta") or {})
         dependencies = dict(meta.get("dependencies") or {})
         wheels = list(dependencies.get("wheels") or [])
-        wheels.append(record)
+        wheels.extend(records)
         dependencies["wheels"] = wheels
         meta["dependencies"] = dependencies
         manifest["meta"] = meta

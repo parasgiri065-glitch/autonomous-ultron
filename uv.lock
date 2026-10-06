@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -2261,6 +2261,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "litellm" },
+    { name = "packaging" },
     { name = "pydantic" },
     { name = "rich" },
 ]
@@ -2282,6 +2283,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "jsonschema", marker = "extra == 'schema'", specifier = ">=4.21" },
     { name = "litellm", specifier = ">=1.40" },
+    { name = "packaging", specifier = ">=24" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "rich", specifier = ">=13.7" },
 ]

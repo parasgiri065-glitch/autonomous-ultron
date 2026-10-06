@@ -110,6 +110,138 @@ def test_records_and_verifies_sha256(tmp_path: Path):
         fetcher.verify(path)
 
 
+def _pkg_meta(name: str, version: str, requires: list[str] | None, releases=None) -> dict:
+    wheel = f"{name}-{version}-py3-none-any.whl"
+    return {
+        "info": {"name": name, "version": version, "requires_dist": requires},
+        "urls": [{"filename": wheel, "url": f"https://files.pythonhosted.org/packages/{wheel}"}],
+        "releases": releases or {},
+    }
+
+
+def _pypi_opener(metadata: dict[str, dict]):
+    """Serve fixture PyPI metadata keyed by URL path after ``/pypi/``."""
+    requested: list[str] = []
+
+    def open_url(request, timeout=0):
+        url = request.full_url if hasattr(request, "full_url") else str(request)
+        requested.append(url)
+        if url.startswith("https://pypi.org/pypi/"):
+            key = url.removeprefix("https://pypi.org/pypi/")
+            if key not in metadata:
+                raise AssertionError(f"unexpected metadata URL: {url}")
+            return _Response(json.dumps(metadata[key]).encode(), url)
+        filename = url.rsplit("/", 1)[-1]
+        return _Response(f"wheel-bytes:{filename}".encode(), url)
+
+    return open_url, requested
+
+
+def test_fetch_closure_seals_transitive_dependencies(tmp_path: Path):
+    metadata = {
+        "fixturepkg/json": _pkg_meta(
+            "fixturepkg",
+            "1.2.3",
+            ["childpkg >=1.0", 'skippedpkg; python_version < "3.0"'],
+        ),
+        # The cycle back to fixturepkg must be visited once, not fetched twice.
+        "childpkg/json": _pkg_meta("childpkg", "1.5.0", ["grandchild >=0.9", "fixturepkg"]),
+        "grandchild/json": _pkg_meta("grandchild", "0.9.1", None),
+    }
+    opener, requested = _pypi_opener(metadata)
+    fetcher = WheelFetcher(_settings(tmp_path), opener=opener)
+    records = fetcher.fetch_closure("fixturepkg")
+    assert [record["package"] for record in records] == ["fixturepkg", "childpkg", "grandchild"]
+    assert [record["version"] for record in records] == ["1.2.3", "1.5.0", "0.9.1"]
+    for record in records:
+        path = Path(record["path"])
+        assert path.is_file()
+        assert record["path"].startswith(str(fetcher.wheels_dir))
+        assert fetcher.verify(path)["sha256"] == record["sha256"]
+    # Marker-gated requirement is never resolved or downloaded.
+    assert not any("skippedpkg" in url for url in requested)
+    assert requested.count("https://pypi.org/pypi/fixturepkg/json") == 1
+
+
+def test_fetch_closure_pins_release_that_satisfies_the_specifier(tmp_path: Path):
+    metadata = {
+        "fixturepkg/json": _pkg_meta("fixturepkg", "1.2.3", ["pinnedpkg >=1.0,<2"]),
+        "pinnedpkg/json": _pkg_meta(
+            "pinnedpkg",
+            "2.1.0",
+            None,
+            releases={
+                "1.9.0": [{"filename": "pinnedpkg-1.9.0-py3-none-any.whl"}],
+                "2.1.0": [{"filename": "pinnedpkg-2.1.0-py3-none-any.whl"}],
+            },
+        ),
+        "pinnedpkg/1.9.0/json": _pkg_meta("pinnedpkg", "1.9.0", None),
+    }
+    opener, requested = _pypi_opener(metadata)
+    fetcher = WheelFetcher(_settings(tmp_path), opener=opener)
+    records = fetcher.fetch_closure("fixturepkg")
+    pinned = [record for record in records if record["package"] == "pinnedpkg"]
+    assert [record["version"] for record in pinned] == ["1.9.0"]
+    assert "https://pypi.org/pypi/pinnedpkg/1.9.0/json" in requested
+    assert not any(url.endswith("/pinnedpkg/2.1.0/json") for url in requested)
+
+
+def test_fetch_closure_enforces_package_cap(tmp_path: Path):
+    metadata = {
+        "fixturepkg/json": _pkg_meta("fixturepkg", "1.2.3", ["childpkg"]),
+        "childpkg/json": _pkg_meta("childpkg", "1.5.0", ["grandchild"]),
+        "grandchild/json": _pkg_meta("grandchild", "0.9.1", None),
+    }
+    opener, _requested = _pypi_opener(metadata)
+    fetcher = WheelFetcher(_settings(tmp_path), opener=opener)
+    with pytest.raises(WheelFetchError, match="exceeds 2 packages"):
+        fetcher.fetch_closure("fixturepkg", max_packages=2)
+
+
+def test_closure_wheels_are_mounted_read_only_and_installed_together(tmp_path: Path):
+    settings = _settings(tmp_path)
+    wheel_dir = settings.state_dir / "wheels"
+    wheel_dir.mkdir(parents=True)
+    names = ["fixturepkg", "childpkg", "grandchild"]
+    records = []
+    for name in names:
+        wheel = wheel_dir / f"{name}-1.0.0-py3-none-any.whl"
+        wheel.write_bytes(f"wheel-bytes:{name}".encode())
+        records.append(
+            {
+                "package": name,
+                "version": "1.0.0",
+                "filename": wheel.name,
+                "path": str(wheel),
+                "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+            }
+        )
+    manifest = ToolManifest(
+        name="closure_fixture",
+        version="0.1.0",
+        entrypoint="python tool.py",
+        risk="low",
+        meta={"dependencies": {"wheels": records}},
+    )
+    decision = PolicyDecision(
+        action="allow",
+        reason="offline closure fixture",
+        risk="low",
+        tool=manifest.name,
+        version=manifest.version,
+        granted=True,
+        network="none",
+    )
+    argv = Sandbox(settings, backend="docker").docker_command_preview(manifest, decision)
+    joined = " ".join(argv)
+    assert "--network=none" in argv
+    for name in names:
+        wheel = wheel_dir / f"{name}-1.0.0-py3-none-any.whl"
+        assert f"{wheel}:/wheels/{wheel.name}:ro" in argv
+        assert f"{name}==1.0.0" in joined
+    assert "--no-index" in joined and "--find-links /wheels" in joined
+
+
 def test_wheel_is_mounted_read_only_and_network_stays_sealed(tmp_path: Path):
     settings = _settings(tmp_path)
     wheel = settings.state_dir / "wheels" / "fixturepkg-1.2.3-py3-none-any.whl"

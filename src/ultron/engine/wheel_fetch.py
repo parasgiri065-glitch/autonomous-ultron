@@ -13,18 +13,30 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from ..config import Settings, get_settings
 from ..errors import UltronError
 
 ALLOWED_HOSTS = frozenset({"pypi.org", "files.pythonhosted.org"})
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_PACKAGES = 24
 _PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,126}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.!+~-]{0,126}$")
 _ARTIFACT_SUFFIXES = (".whl", ".tar.gz", ".zip")
+# Base-install marker environment: everything PEP 508 defines on the host, with
+# ``extra`` pinned to "" so extra-conditional requirements evaluate false
+# exactly as pip treats them for a plain (no-extras) install.
+_MARKER_ENV = {**default_environment(), "extra": ""}
 
 
 class WheelFetchError(UltronError):
@@ -54,6 +66,53 @@ class WheelFetcher:
 
     def fetch(self, package: str, version: str | None = None) -> Path:
         """Download an allowlisted PyPI artifact and write its SHA-256 attestation."""
+        path, _record, _info = self._fetch_one(package, version)
+        return path
+
+    def fetch_closure(
+        self,
+        package: str,
+        version: str | None = None,
+        *,
+        max_packages: int = DEFAULT_MAX_PACKAGES,
+    ) -> list[dict[str, Any]]:
+        """Seal an artifact for ``package`` and its whole dependency closure.
+
+        Walks ``requires_dist`` breadth-first from PyPI JSON metadata,
+        evaluating PEP 508 markers for a plain base install (no extras), and
+        returns one verified SHA-256 record per package.  The sandbox mounts
+        every record read-only and pip installs them with ``--no-index
+        --find-links``, so the closure is what makes offline installs of
+        JIT-forged tools succeed.
+        """
+        if max_packages <= 0:
+            raise ValueError("max_packages must be positive")
+        root_version = self.validate_version(version) if version is not None else None
+        queue: deque[tuple[str, str | None]] = deque(
+            [(self.validate_package(package), root_version)]
+        )
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        while queue:
+            name, pin = queue.popleft()
+            key = canonicalize_name(name)
+            if key in seen:
+                continue
+            if len(seen) >= max_packages:
+                raise WheelFetchError(
+                    f"dependency closure for {package} exceeds {max_packages} packages"
+                )
+            seen.add(key)
+            _path, record, info = self._fetch_one(name, pin)
+            records.append(record)
+            for dep_name, dep_specifier in self._base_requirements(info):
+                queue.append((dep_name, self._resolve_version(dep_name, dep_specifier)))
+        return records
+
+    def _fetch_one(
+        self, package: str, version: str | None = None
+    ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+        """Fetch one artifact; return its path, attestation record, and PyPI info."""
         package = self.validate_package(package)
         if version is not None:
             version = self.validate_version(version)
@@ -89,7 +148,74 @@ class WheelFetcher:
             "path": str(destination),
         }
         self._write_record(destination, record)
-        return destination
+        return destination, record, info
+
+    @staticmethod
+    def _base_requirements(info: dict[str, Any]) -> list[tuple[str, str]]:
+        """Parse ``requires_dist`` entries needed for a base install.
+
+        Returns ``(name, specifier)`` pairs for requirements whose markers
+        hold without any extra selected; unparseable or unresolvable entries
+        are skipped because they are never required by a plain install.
+        """
+        raw = info.get("requires_dist")
+        if not isinstance(raw, list):
+            return []
+        requirements: list[tuple[str, str]] = []
+        for entry in raw:
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            try:
+                requirement = Requirement(entry)
+                if requirement.marker is not None and not requirement.marker.evaluate(_MARKER_ENV):
+                    continue
+            except Exception:
+                # Malformed or unresolvable metadata never applies to a base
+                # install, so it must not abort the closure walk.
+                continue
+            requirements.append((requirement.name, str(requirement.specifier)))
+        return requirements
+
+    def _resolve_version(self, package: str, specifier_text: str) -> str | None:
+        """Pick an exact release satisfying ``specifier_text`` (None = latest).
+
+        Latest is used whenever it satisfies the specifier; otherwise the
+        highest matching non-empty release is pinned so the sandbox's
+        ``pkg==version`` install is resolvable offline.
+        """
+        package = self.validate_package(package)
+        if not specifier_text:
+            return None
+        try:
+            specifier = SpecifierSet(specifier_text)
+        except InvalidSpecifier as exc:
+            raise WheelFetchError(
+                f"invalid dependency specifier for {package}: {specifier_text}"
+            ) from exc
+        metadata = self._json(f"https://pypi.org/pypi/{package}/json")
+        info = metadata.get("info")
+        latest = str(info.get("version") or "") if isinstance(info, dict) else ""
+        if latest:
+            try:
+                if specifier.contains(latest):
+                    return None
+            except InvalidVersion:
+                pass
+        releases = metadata.get("releases")
+        candidates: list[Version] = []
+        if isinstance(releases, dict):
+            for raw_version, files in releases.items():
+                if not isinstance(files, list) or not files:
+                    continue  # yanked or withdrawn releases ship no files
+                try:
+                    parsed = Version(str(raw_version))
+                except InvalidVersion:
+                    continue
+                if specifier.contains(str(parsed)):
+                    candidates.append(parsed)
+        if not candidates:
+            raise WheelFetchError(f"no release of {package} satisfies {specifier_text}")
+        return str(max(candidates))
 
     def verify(self, path: Path | str) -> dict[str, Any]:
         """Recompute and verify a previously recorded artifact digest."""
@@ -252,4 +378,10 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["ALLOWED_HOSTS", "DEFAULT_MAX_BYTES", "WheelFetchError", "WheelFetcher"]
+__all__ = [
+    "ALLOWED_HOSTS",
+    "DEFAULT_MAX_BYTES",
+    "DEFAULT_MAX_PACKAGES",
+    "WheelFetchError",
+    "WheelFetcher",
+]
